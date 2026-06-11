@@ -1,9 +1,9 @@
 import json
 import tiktoken
+import requests
 from typing import Callable, Any
 from dataclasses import dataclass, field
 import time
-import json
 import sqlite3
 from datetime import datetime, UTC
 from enum import Enum
@@ -46,6 +46,9 @@ def format_tool_error(error: ToolError) -> str:
         parts.append(f"Suggested action: {error.suggestion}")
     return "\n".join(parts)
 
+'''
+Creates agent DB with SQLite to track sessions and tool invocations and provide analytics
+'''
 class AgentState:
     def __init__(self, db_path: str = "agent_state.db"):
         self.db = sqlite3.connect(db_path)
@@ -79,6 +82,9 @@ class AgentState:
         rate = self.db.execute("SELECT AVG(success) FROM tool_invocations WHERE session_id = ?", (session_id,)).fetchone()[0] or 0
         return {"total_invocations": total, "success_rate": round(rate * 100, 1)}
 
+'''
+Tracks token usage and tool calls, checks for budget limits and prevents excessive usage
+'''
 class BudgetEnforcer:
     def __init__(self, config: BudgetConfig):
         self.config = config
@@ -106,11 +112,12 @@ class BudgetEnforcer:
                 return f"Per-tool limit: '{tool}' called {count} times"
         return None
 
+
 class AgentMemory:
     def __init__(self, config: MemoryConfig):
         self.config = config
         self.messages: list[dict] = []
-        self.encoder = tiktoken.encoding_for_model("gpt-4o")
+        self.encoder = tiktoken.encoding_for_model("gpt-5-")
 
     def add(self, role: str, content: str, **kwargs):
         self.messages.append({"role": role, "content": content, **kwargs})
@@ -209,3 +216,23 @@ class AgentHarness:
                         result = f"Error: {type(e).__name__}: {e}"
                 messages.append({"role": "tool", "content": str(result), "tool_call_id": call.id})
         return "Max iterations reached."
+
+class Wrapper:
+    def __init__(self, agent: AgentHarness, model):
+        self.agent = agent
+        self.model = model
+
+    def message_builder(self, user_input: str) -> list[dict]:
+        r = requests.post("http://localhost:1234/api/v1/chat", json={
+            "model": "qwen/qwen3.5-9b",
+            "system_prompt": "You are a helpful assistant. Answer the user's question based on your knowlddge in a concise manner. End the conversation with <end_of_conversation> token.",
+            "input": user_input
+        })
+        return r
+        
+    def start(self, user_input: str) -> str:
+
+        return self.agent.run(user_input)
+
+if __name__ == "__main__":
+    Wrapper.start("What is the weather in New York?")
