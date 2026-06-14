@@ -217,6 +217,12 @@ class AgentHarness:
                 messages.append({"role": "tool", "content": str(result), "tool_call_id": call.id})
         return "Max iterations reached."
 
+'''
+Wrapper.chat(messages, tools) → HTTP POST → local LLM → parse response → return object with .content / .tool_calls / .message
+                                     ↑
+                              This is what AgentHarness calls
+'''
+
 class Wrapper:
     def __init__(self, agent: AgentHarness, model):
         self.agent = agent
