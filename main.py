@@ -237,8 +237,12 @@ class Wrapper:
         return r
         
     def start(self, user_input: str) -> str:
+        while True:
+            r = self.message_builder(user_input)
+            print("Raw response:", r.text)
+            return
 
-        return self.agent.run(user_input)
 
 if __name__ == "__main__":
-    Wrapper.start("What is the weather in New York?")
+    w = Wrapper(None, None)
+    w.start("What is the weather in New York?")
