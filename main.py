@@ -1,12 +1,24 @@
 import json
 import tiktoken
 import requests
+import os
+from dotenv import load_dotenv, dotenv_values 
 from typing import Callable, Any
 from dataclasses import dataclass, field
 import time
 import sqlite3
 from datetime import datetime, UTC
 from enum import Enum
+load_dotenv() 
+
+@dataclass
+class LLMResponse:
+    content: str
+    tool_calls: list
+    message: dict
+    response_id: str
+    stats: dict
+    output: list
 
 @dataclass
 class Tool:
@@ -176,6 +188,7 @@ class ToolRegistry:
 class AgentHarness:
     def __init__(self, model, system_prompt: str = ""):
         self.model = model
+        self.wrapper = Wrapper(model)
         self.system_prompt = system_prompt
         self.tools: dict[str, Tool] = {}
         self.max_iterations = 10
@@ -198,7 +211,7 @@ class AgentHarness:
             {"role": "user", "content": user_input},
         ]
         for i in range(self.max_iterations):
-            response = self.model.chat(
+            response = self.wrapper.chat(
                 messages=messages, tools=self.tool_list() if self.tools else None,
             )
             if not response.tool_calls:
@@ -219,30 +232,48 @@ class AgentHarness:
 
 '''
 Wrapper.chat(messages, tools) → HTTP POST → local LLM → parse response → return object with .content / .tool_calls / .message
-                                     ↑
-                              This is what AgentHarness calls
 '''
 
 class Wrapper:
-    def __init__(self, agent: AgentHarness, model):
-        self.agent = agent
+    def __init__(self, model):
         self.model = model
 
-    def message_builder(self, user_input: str) -> list[dict]:
-        r = requests.post("http://localhost:1234/api/v1/chat", json={
-            "model": "qwen/qwen3.5-9b",
-            "system_prompt": "You are a helpful assistant. Answer the user's question based on your knowlddge in a concise manner. End the conversation with <end_of_conversation> token.",
-            "input": user_input
-        })
-        return r
-        
-    def start(self, user_input: str) -> str:
-        while True:
-            r = self.message_builder(user_input)
-            print("Raw response:", r.text)
-            return
+    def chat(self, messages: list[dict], tools: list[dict] = None) -> LLMResponse:
+        base_prompt = "You are a helpful assistant. Answer the user's question based on your knowlddge in a concise manner. End the conversation with <end_of_conversation> token."
+        r = requests.post("http://localhost:1234/api/v1/chat", 
+            headers={"authorization" : "Bearer " + os.getenv("API_KEY"),},
+            json={
+                "model": self.model,
+                "system_prompt": messages[0].get('content'),
+                "input": messages[1].get('content'),
+                "integrations": ["mcp/duck-duck-go-search"],
+            })
+        return self.parse_response(r)
+    def parse_response(self, response: requests.Response) -> dict:
+        if response.status_code != 200:
+            return {"error": f"HTTP {response.status_code}: {response.text}"}
+        data = response.json()
+        output = data.get("output")
+        tools = []
+        reason = ""
+        msg = ""
+        for i in range(len(output)):
+            if output[i].get("type") == "reasoning":
+                reason += output[i].get("content")
+            elif output[i].get("type") == "message":
+                msg += output[i].get("content")
+            elif output[i].get("type") == "tool_call":
+                tools.append([output[i].get("tool",""),output[i].get("arguments",""),output[i].get("output",""),output[i].get("provider_info","")])
+        return LLMResponse(
+            content=reason,
+            tool_calls=tools,
+            message=msg,
+            response_id=data.get("response_id", ""),
+            stats=data.get("stats", ""),
+            output=output,
+        )
 
 
 if __name__ == "__main__":
-    w = Wrapper(None, None)
-    w.start("What is the weather in New York?")
+    a = AgentHarness("qwen/qwen3.5-9b")
+    print(a.run("What is the day today?"))
