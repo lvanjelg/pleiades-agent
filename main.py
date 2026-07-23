@@ -11,6 +11,20 @@ from datetime import datetime, UTC
 from enum import Enum
 load_dotenv() 
 
+
+logo = r"""
+██╗  ██╗███████╗██████╗ ██╗  ██╗ █████╗ ███████╗███████╗████████╗██╗   ██╗███████╗
+██║  ██║██╔════╝██╔══██╗██║  ██║██╔══██╗██╔════╝██╔════╝╚══██╔══╝██║   ██║██╔════╝
+███████║█████╗  ██████╔╝███████║███████║█████╗  ███████╗   ██║   ██║   ██║███████╗
+██╔══██║██╔══╝  ██╔═══╝ ██╔══██║██╔══██║██╔══╝  ╚════██║   ██║   ██║   ██║╚════██║
+██║  ██║███████╗██║     ██║  ██║██║  ██║███████╗███████║   ██║   ╚██████╔╝███████║
+╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝    ╚═════╝ ╚══════╝
+                                                                                  """
+
+
+
+
+
 @dataclass
 class LLMResponse:
     content: str
@@ -215,7 +229,7 @@ class AgentHarness:
                 messages=messages, tools=self.tool_list() if self.tools else None,
             )
             if not response.tool_calls:
-                return response.content
+                return response.message
             messages.append(response.message)
             for call in response.tool_calls:
                 tool = self.tools.get(call.function.name)
@@ -275,5 +289,9 @@ class Wrapper:
 
 
 if __name__ == "__main__":
-    a = AgentHarness("qwen/qwen3.5-9b")
-    print(a.run("What is the day today?"))
+    print(logo)
+    while True:
+        print("-"*50)
+        user_in = input("> ")
+        a = AgentHarness("qwen/qwen3.5-9b")
+        print(a.run(user_in))
