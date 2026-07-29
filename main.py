@@ -8,10 +8,10 @@ from typing import Callable, Any
 from dataclasses import dataclass, field
 import time
 import sqlite3
-from datetime import datetime, UTC
+from datetime import datetime as dt, UTC
 from enum import Enum
 load_dotenv() 
-
+logger = logging.getLogger(__name__)
 LOG_DIR = "logs/"
 
 logo = r"""
@@ -230,6 +230,9 @@ class AgentHarness:
             response = self.wrapper.chat(
                 messages=messages, tools=self.tool_list() if self.tools else None,
             )
+            logger.info(response)
+            logger.info("[reasoning]" + response.content)
+            logger.info("[response]" + response.message)
             if not response.tool_calls:
                 return response.message
             messages.append(response.message)
@@ -293,7 +296,10 @@ class Wrapper:
 if __name__ == "__main__":
     print(logo)
     while True:
+        iso_time = dt.now().isoformat()
+        logging.basicConfig(level=logging.INFO,handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],)
         print("-"*50)
         user_in = input("> ")
+        logger.info(user_in)
         a = AgentHarness("qwen/qwen3.5-9b")
         print(a.run(user_in))
