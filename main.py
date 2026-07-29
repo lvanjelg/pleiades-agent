@@ -2,6 +2,7 @@ import json
 import tiktoken
 import requests
 import os
+import logging
 from dotenv import load_dotenv, dotenv_values 
 from typing import Callable, Any
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from datetime import datetime, UTC
 from enum import Enum
 load_dotenv() 
 
+LOG_DIR = "logs/"
 
 logo = r"""
 ██████╗ ██╗     ███████╗██╗ █████╗ ██████╗ ███████╗███████╗
