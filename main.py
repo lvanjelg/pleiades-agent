@@ -236,17 +236,17 @@ class AgentHarness:
             if not response.tool_calls:
                 return response.message
             messages.append(response.message)
-            for call in response.tool_calls:
-                tool = self.tools.get(call.function.name)
-                if not tool:
-                    result = f"Error: Unknown tool '{call.function.name}'"
-                else:
-                    try:
-                        args = json.loads(call.function.arguments)
-                        result = tool.fn(**args)
-                    except Exception as e:
-                        result = f"Error: {type(e).__name__}: {e}"
-                messages.append({"role": "tool", "content": str(result), "tool_call_id": call.id})
+            # for call in response.tool_calls:
+            #     tool = self.tools.get(call.function.name)
+            #     if not tool:
+            #         result = f"Error: Unknown tool '{call.function.name}'"
+            #     else:
+            #         try:
+            #             args = json.loads(call.function.arguments)
+            #             result = tool.fn(**args)
+            #         except Exception as e:
+            #             result = f"Error: {type(e).__name__}: {e}"
+            #     messages.append({"role": "tool", "content": str(result), "tool_call_id": call.id})
         return "Max iterations reached."
 
 '''
@@ -300,6 +300,8 @@ if __name__ == "__main__":
         logging.basicConfig(level=logging.INFO,handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],)
         print("-"*50)
         user_in = input("> ")
+        if user_in == '/stop' or user_in == '/s':
+            break
         logger.info(user_in)
         a = AgentHarness("qwen/qwen3.5-9b")
         print(a.run(user_in))
