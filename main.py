@@ -28,7 +28,7 @@ logo = r"""
 
 @dataclass
 class ToolCall:
-    call_id: int
+    call_id: int | str
     name: str
     args: dict
     output: str = ""
@@ -101,7 +101,7 @@ class AgentState:
     def create_session(self, session_id: str, user_id: str):
         self.db.execute(
             "INSERT INTO sessions VALUES (?, ?, ?, ?)",
-            (session_id, datetime.now(UTC).isoformat(), datetime.now(UTC).isoformat(), user_id))
+            (session_id, dt.now(UTC).isoformat(), dt.now(UTC).isoformat(), user_id))
         self.db.commit()
 
     def record_tool_invocation(self, session_id: str, turn: int,
@@ -110,7 +110,7 @@ class AgentState:
         self.db.execute(
             "INSERT INTO tool_invocations VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
             (session_id, turn, tool, json.dumps(args), result,
-             int(success), duration_ms, datetime.now(UTC).isoformat()))
+             int(success), duration_ms, dt.now(UTC).isoformat()))
         self.db.commit()
 
     def get_analytics(self, session_id: str) -> dict:
@@ -240,21 +240,20 @@ class AgentHarness:
             )
             logger.info(response)
             logger.info("[reasoning]" + response.content)
-            logger.info("[response]" + response.message)
+            logger.info("[response]" + response.content)
             if not response.tool_calls:
-                return response.message
+                return response.content
             messages.append(response.message)
-            # for call in response.tool_calls:
-            #     tool = self.tools.get(call.function.name)
-            #     if not tool:
-            #         result = f"Error: Unknown tool '{call.function.name}'"
-            #     else:
-            #         try:
-            #             args = json.loads(call.function.arguments)
-            #             result = tool.fn(**args)
-            #         except Exception as e:
-            #             result = f"Error: {type(e).__name__}: {e}"
-            #     messages.append({"role": "tool", "content": str(result), "tool_call_id": call.id})
+            for call in response.tool_calls:
+                tool = self.tools.get(call.name)
+                if not tool:
+                    result = f"Error: Unknown tool '{call.name}'"
+                else:
+                    try:
+                        result = tool.fn(**call.args)
+                    except Exception as e:
+                        result = f"Error: {type(e).__name__}: {e}"
+                messages.append({"role": "tool", "content": str(result), "tool_call_id": call.call_id})
         return "Max iterations reached."
 
 '''
@@ -264,58 +263,58 @@ Wrapper.chat(messages, tools) → HTTP POST → local LLM → parse response →
 class Wrapper:
     def __init__(self, model):
         self.model = model
-        self.tool_id = 0
+        self.tool_id = 1
 
     def chat(self, messages: list[dict], tools: list[dict] = None) -> LLMResponse:
-        base_prompt = "You are a helpful assistant. Answer the user's question based on your knowlddge in a concise manner. End the conversation with <end_of_conversation> token."
-        r = requests.post("http://localhost:1234/api/v1/chat", 
+        r = requests.post("http://192.168.1.92:1234/v1/chat/completions", 
             headers={"authorization" : "Bearer " + os.getenv("API_KEY"),},
             json={
                 "model": self.model,
-                "system_prompt": messages[0].get('content'),
-                "input": messages[1].get('content'),
-                "integrations": ["mcp/duck-duck-go-search"],
+                "messages": messages,
+                "tools": tools,
             })
         return self.parse_response(r)
     def parse_response(self, response: requests.Response) -> dict:
         if response.status_code != 200:
             return {"error": f"HTTP {response.status_code}: {response.text}"}
         data = response.json()
-        output = data.get("output")
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content") or ""
         tools = []
-        reason = ""
-        msg = ""
-        for i in range(len(output)):
-            item = output[i]
-            if item.get("type") == "reasoning":
-                reason += item.get("content")
-            elif item.get("type") == "message":
-                msg += item.get("content")
-            elif item.get("type") == "tool_call":
+        for tc in message.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            call_id = tc.get("id")
+            if not call_id:
+                call_id = self.tool_id
                 self.tool_id += 1
-                tools.append(ToolCall(
-                    call_id=self.tool_id,
-                    name=item.get("tool", ""),
-                    args=item.get("arguments", {}),
-                    output=item.get("output", ""),
-                    error="",
-                    provider_info=item.get("provider_info", {}),
-                ))
+            tools.append(ToolCall(
+                call_id=call_id,
+                name=fn.get("name", ""),
+                args=args,
+                output="",
+                error="",
+                provider_info={},
+            ))
         return LLMResponse(
-            content=reason,
+            content=content,
             tool_calls=tools,
-            message=msg,
-            response_id=data.get("response_id", ""),
-            stats=data.get("stats", ""),
-            output=output,
+            message=message,
+            response_id=data.get("id", ""),
+            stats=data.get("usage", {}),
+            output=[],
         )
 
 
 if __name__ == "__main__":
     print(logo)
     a = AgentHarness("qwen/qwen3.5-9b")
+    iso_time = dt.now().isoformat()
     while True:
-        iso_time = dt.now().isoformat()
         logging.basicConfig(level=logging.INFO,handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],)
         print("-"*50)
         user_in = input("> ")
