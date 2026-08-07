@@ -26,6 +26,14 @@ logo = r"""
 
 
 
+@dataclass
+class ToolCall:
+    call_id: int
+    name: str
+    args: dict
+    output: str = ""
+    error: str = ""
+    provider_info: dict = field(default_factory=dict)
 
 @dataclass
 class LLMResponse:
@@ -256,6 +264,7 @@ Wrapper.chat(messages, tools) → HTTP POST → local LLM → parse response →
 class Wrapper:
     def __init__(self, model):
         self.model = model
+        self.tool_id = 0
 
     def chat(self, messages: list[dict], tools: list[dict] = None) -> LLMResponse:
         base_prompt = "You are a helpful assistant. Answer the user's question based on your knowlddge in a concise manner. End the conversation with <end_of_conversation> token."
@@ -277,12 +286,21 @@ class Wrapper:
         reason = ""
         msg = ""
         for i in range(len(output)):
-            if output[i].get("type") == "reasoning":
-                reason += output[i].get("content")
-            elif output[i].get("type") == "message":
-                msg += output[i].get("content")
-            elif output[i].get("type") == "tool_call":
-                tools.append([output[i].get("tool",""),output[i].get("arguments",""),output[i].get("output",""),output[i].get("provider_info","")])
+            item = output[i]
+            if item.get("type") == "reasoning":
+                reason += item.get("content")
+            elif item.get("type") == "message":
+                msg += item.get("content")
+            elif item.get("type") == "tool_call":
+                self.tool_id += 1
+                tools.append(ToolCall(
+                    call_id=self.tool_id,
+                    name=item.get("tool", ""),
+                    args=item.get("arguments", {}),
+                    output=item.get("output", ""),
+                    error="",
+                    provider_info=item.get("provider_info", {}),
+                ))
         return LLMResponse(
             content=reason,
             tool_calls=tools,
@@ -295,6 +313,7 @@ class Wrapper:
 
 if __name__ == "__main__":
     print(logo)
+    a = AgentHarness("qwen/qwen3.5-9b")
     while True:
         iso_time = dt.now().isoformat()
         logging.basicConfig(level=logging.INFO,handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],)
@@ -303,5 +322,4 @@ if __name__ == "__main__":
         if user_in == '/stop' or user_in == '/s':
             break
         logger.info(user_in)
-        a = AgentHarness("qwen/qwen3.5-9b")
         print(a.run(user_in))
