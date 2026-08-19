@@ -3,6 +3,7 @@ import tiktoken
 import requests
 import os
 import logging
+import uuid
 from dotenv import load_dotenv, dotenv_values 
 from typing import Callable, Any
 from dataclasses import dataclass, field
@@ -14,6 +15,10 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 LOG_DIR = "logs/"
 
+with open("prompt.md", encoding="utf-8") as _prompt_file:
+    SYS_PROMPT = _prompt_file.read().replace(
+        "{current_date}", dt.now().date().isoformat())
+
 logo = r"""
 ██████╗ ██╗     ███████╗██╗ █████╗ ██████╗ ███████╗███████╗
 ██╔══██╗██║     ██╔════╝██║██╔══██╗██╔══██╗██╔════╝██╔════╝
@@ -22,9 +27,6 @@ logo = r"""
 ██║     ███████╗███████╗██║██║  ██║██████╔╝███████╗███████║
 ╚═╝     ╚══════╝╚══════╝╚═╝╚═╝  ╚═╝╚═════╝ ╚══════╝╚══════╝
                                                            """
-
-
-
 
 @dataclass
 class ToolCall:
@@ -81,42 +83,6 @@ def format_tool_error(error: ToolError) -> str:
     if error.suggestion:
         parts.append(f"Suggested action: {error.suggestion}")
     return "\n".join(parts)
-
-'''
-Creates agent DB with SQLite to track sessions and tool invocations and provide analytics
-'''
-class AgentState:
-    def __init__(self, db_path: str = "agent_state.db"):
-        self.db = sqlite3.connect(db_path)
-        self.db.execute("""CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY, created_at TEXT,
-            last_active TEXT, user_id TEXT)""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS tool_invocations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT, turn_number INTEGER,
-            tool_name TEXT, arguments TEXT, result TEXT,
-            success INTEGER, duration_ms INTEGER, timestamp TEXT)""")
-        self.db.commit()
-
-    def create_session(self, session_id: str, user_id: str):
-        self.db.execute(
-            "INSERT INTO sessions VALUES (?, ?, ?, ?)",
-            (session_id, dt.now(UTC).isoformat(), dt.now(UTC).isoformat(), user_id))
-        self.db.commit()
-
-    def record_tool_invocation(self, session_id: str, turn: int,
-                                tool: str, args: dict, result: str,
-                                success: bool, duration_ms: int):
-        self.db.execute(
-            "INSERT INTO tool_invocations VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, turn, tool, json.dumps(args), result,
-             int(success), duration_ms, dt.now(UTC).isoformat()))
-        self.db.commit()
-
-    def get_analytics(self, session_id: str) -> dict:
-        total = self.db.execute("SELECT COUNT(*) FROM tool_invocations WHERE session_id = ?", (session_id,)).fetchone()[0]
-        rate = self.db.execute("SELECT AVG(success) FROM tool_invocations WHERE session_id = ?", (session_id,)).fetchone()[0] or 0
-        return {"total_invocations": total, "success_rate": round(rate * 100, 1)}
 
 '''
 Tracks token usage and tool calls, checks for budget limits and prevents excessive usage
@@ -208,6 +174,141 @@ class ToolRegistry:
     def execute(self, tool_name: str, arguments: dict) -> Any:
         self.call_counts[tool_name] += 1
         return self.tools[tool_name].fn(**arguments)
+
+
+def websearch(query: str, search_depth: str = "basic", freshness: str | None = None) -> str:
+    payload = {
+        "query": query,
+        "search_depth": search_depth,
+        "max_results": 5,
+        "include_answer": False,
+    }
+    if freshness is not None:
+        payload["time_range"] = freshness
+
+    api_key = os.getenv("TAVILY_KEY")
+    if not api_key:
+        raise ValueError("TAVILY_KEY not set")
+
+    r = requests.post(
+        "https://api.tavily.com/search",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json=payload,
+        timeout=10,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Tavily search failed: HTTP {r.status_code}: {r.text}")
+
+    data = r.json()
+    results = data.get("results", [])
+    trimmed = [
+        {key: item.get(key) for key in ("title", "url", "content", "score")}
+        for item in results
+    ]
+    return json.dumps(trimmed)
+
+
+def load_tools(tools_path: str = "tools.json",
+               handlers: dict[str, Callable] | None = None) -> list[Tool]:
+    handlers = handlers or {}
+    with open(tools_path, encoding="utf-8") as f:
+        data = json.load(f)
+    tools = []
+    for entry in data.get("tools", []):
+        fn = entry.get("function", {})
+        name = fn.get("name")
+        handler = handlers.get(name)
+        if handler is None:
+            raise ValueError(f"No handler registered for tool '{name}'")
+        tools.append(Tool(
+            name=name,
+            description=fn.get("description", ""),
+            parameters=fn.get("parameters", {}),
+            fn=handler,
+        ))
+    return tools
+
+
+    
+'''
+Creates agent DB with SQLite to track sessions and tool invocations and provide analytics
+'''
+class AgentState:
+    def __init__(self, db_path: str = "agent_state.db"):
+        self.db = sqlite3.connect(db_path)
+        self.db.execute("""CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY, created_at TEXT,
+            last_active TEXT, user_id TEXT)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS tool_invocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool_call_id TEXT,
+            session_id TEXT, turn_number INTEGER,
+            tool_name TEXT, arguments TEXT, result TEXT,
+            success INTEGER, duration_ms INTEGER, timestamp TEXT)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS messages (
+            message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT, turn_number INTEGER,
+            tool_name TEXT, role TEXT, content TEXT,
+            tool_call_id TEXT, tool_calls TEXT,
+            timestamp TEXT)""")
+        self.db.commit()
+        
+    def create_session(self, session_id: str, user_id: str):
+        self.db.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?)",
+            (session_id, dt.now(UTC).isoformat(), dt.now(UTC).isoformat(), user_id))
+        self.db.commit()
+
+    def record_tool_invocation(self, tool_call_id: str, session_id: str, turn: int,
+                                tool: str, args: dict, result: str,
+                                success: bool, duration_ms: int):
+        self.db.execute(
+            "INSERT INTO tool_invocations "
+            "(tool_call_id, session_id, turn_number, tool_name, arguments, "
+            "result, success, duration_ms, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (tool_call_id, session_id, turn, tool, json.dumps(args), result,
+             int(success), duration_ms, dt.now(UTC).isoformat()))
+        self.db.commit()
+
+    def record_message(self, session_id: str, turn: int,
+                        role: str, content: str,
+                        tool_name: str = "",
+                        tool_call_id: str = "",
+                        tool_calls: list | None = None):
+        self.db.execute(
+            "INSERT INTO messages VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, turn, tool_name, role, content,
+             tool_call_id, json.dumps(tool_calls) if tool_calls else None,
+             dt.now(UTC).isoformat()))
+        self.db.commit()
+
+    def get_messages(self, session_id: str) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT session_id, turn_number, tool_name, role, content, "
+            "tool_call_id, tool_calls FROM messages "
+            "WHERE session_id = ? ORDER BY turn_number, message_id",
+            (session_id,)).fetchall()
+        messages = []
+        for _session_id, _turn_number, tool_name, role, content, tool_call_id, tool_calls in rows:
+            msg = {"role": role, "content": content}
+            if tool_calls:
+                try:
+                    msg["tool_calls"] = json.loads(tool_calls)
+                except (json.JSONDecodeError, TypeError):
+                    msg["tool_calls"] = []
+            if tool_call_id:
+                msg["tool_call_id"] = tool_call_id
+            if tool_name:
+                msg["name"] = tool_name
+            messages.append(msg)
+        return messages
+
+    def get_analytics(self, session_id: str) -> dict:
+        total = self.db.execute("SELECT COUNT(*) FROM tool_invocations WHERE session_id = ?", (session_id,)).fetchone()[0]
+        rate = self.db.execute("SELECT AVG(success) FROM tool_invocations WHERE session_id = ?", (session_id,)).fetchone()[0] or 0
+        return {"total_invocations": total, "success_rate": round(rate * 100, 1)}
+
     
 class AgentHarness:
     def __init__(self, model, system_prompt: str = ""):
@@ -215,7 +316,12 @@ class AgentHarness:
         self.wrapper = Wrapper(model)
         self.system_prompt = system_prompt
         self.tools: dict[str, Tool] = {}
-        self.max_iterations = 10
+        self.max_iterations = 100
+        self.state = AgentState()
+        self.session_id = str(uuid.uuid4())
+        self.user_id = "local"
+        self.state.create_session(self.session_id, self.user_id)
+        self.turn = 0
 
     def register_tool(self, tool: Tool):
         self.tools[tool.name] = tool
@@ -230,29 +336,47 @@ class AgentHarness:
         ]
 
     def run(self, user_input: str) -> str:
+        self.turn += 1
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_input},
         ]
+        self.state.record_message(self.session_id, self.turn, "user", user_input)
         for i in range(self.max_iterations):
             response = self.wrapper.chat(
                 messages=messages, tools=self.tool_list() if self.tools else None,
             )
             logger.info(response)
-            logger.info("[reasoning]" + response.content)
+            reasoning = response.message.get("reasoning_content", "") if isinstance(response.message, dict) else ""
+            logger.info("[reasoning]" + reasoning)
             logger.info("[response]" + response.content)
+            self.state.record_message(
+                self.session_id, self.turn, "assistant", response.content or "",
+                tool_calls=response.message.get("tool_calls") if isinstance(response.message, dict) else None,
+            )
             if not response.tool_calls:
                 return response.content
             messages.append(response.message)
             for call in response.tool_calls:
                 tool = self.tools.get(call.name)
+                start = time.monotonic()
                 if not tool:
                     result = f"Error: Unknown tool '{call.name}'"
+                    success = False
                 else:
                     try:
                         result = tool.fn(**call.args)
+                        success = True
                     except Exception as e:
                         result = f"Error: {type(e).__name__}: {e}"
+                        success = False
+                duration_ms = int((time.monotonic() - start) * 1000)
+                self.state.record_tool_invocation(
+                    str(call.call_id), self.session_id, self.turn, call.name, call.args,
+                    str(result), success, duration_ms)
+                self.state.record_message(
+                    self.session_id, self.turn, "tool", str(result),
+                    tool_name=call.name, tool_call_id=str(call.call_id))
                 messages.append({"role": "tool", "content": str(result), "tool_call_id": call.call_id})
         return "Max iterations reached."
 
@@ -266,18 +390,36 @@ class Wrapper:
         self.tool_id = 1
 
     def chat(self, messages: list[dict], tools: list[dict] = None) -> LLMResponse:
-        r = requests.post("http://192.168.1.92:1234/v1/chat/completions", 
-            headers={"authorization" : "Bearer " + os.getenv("API_KEY"),},
-            json={
-                "model": self.model,
-                "messages": messages,
-                "tools": tools,
-            })
+        try:
+            r = requests.post("http://192.168.1.92:1234/v1/chat/completions", 
+                headers={"authorization" : "Bearer " + os.getenv("API_KEY"),},
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "tools": tools,
+                },
+                timeout=300)
+        except requests.exceptions.RequestException as e:
+            return self._error_response(f"Request to LLM server failed: {e}")
         return self.parse_response(r)
-    def parse_response(self, response: requests.Response) -> dict:
+
+    def _error_response(self, message: str) -> LLMResponse:
+        return LLMResponse(
+            content=message,
+            tool_calls=[],
+            message={},
+            response_id="",
+            stats={},
+            output=[],
+        )
+
+    def parse_response(self, response: requests.Response) -> LLMResponse:
         if response.status_code != 200:
-            return {"error": f"HTTP {response.status_code}: {response.text}"}
-        data = response.json()
+            return self._error_response(f"HTTP {response.status_code}: {response.text}")
+        try:
+            data = response.json()
+        except ValueError:
+            return self._error_response(f"Invalid JSON response from LLM server: {response.text[:300]}")
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         content = message.get("content") or ""
@@ -312,13 +454,16 @@ class Wrapper:
 
 if __name__ == "__main__":
     print(logo)
-    a = AgentHarness("qwen/qwen3.5-9b")
     iso_time = dt.now().isoformat()
+    a = AgentHarness("qwen/qwen3.8-27b", SYS_PROMPT)
+    for tool in load_tools("tools.json", {"websearch": websearch}):
+        a.register_tool(tool)
+    logging.basicConfig(level=logging.INFO,handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],)
     while True:
-        logging.basicConfig(level=logging.INFO,handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],)
         print("-"*50)
         user_in = input("> ")
+        logger.info(user_in)
         if user_in == '/stop' or user_in == '/s':
             break
-        logger.info(user_in)
-        print(a.run(user_in))
+        response = a.run(user_in)
+        print(response)
