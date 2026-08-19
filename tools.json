@@ -1,0 +1,32 @@
+{
+    "tools": [
+        {   
+            "type": "function",
+            "function": {
+                "name": "websearch",
+                "description": "Search the web for current, factual, or verifiable information. Use this proactively whenever a question touches on facts that could have changed, specific data, current events, or anything you're not fully certain of — prefer searching over answering from memory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "The search query to run. Rewrite the user's question into an optimized search-engine query: strip conversational language, keep it concise, and use keywords a search engine would match well rather than a full sentence."
+                        },
+                        "search_depth": {
+                            "type": "string",
+                            "enum": ["basic", "advanced"],
+                            "description": "Only use 'advanced' after first trying 'basic' with a refined or alternative query. Escalate to 'advanced' only if you've already searched with your best query at basic depth and still haven't found a sufficient answer — advanced returns more thorough, higher-relevance content per source at higher latency and cost."
+                        },
+                        "freshness": {
+                            "type": "string",
+                            "enum": ["day", "week", "month", "year"],
+                            "description": "Only set this if the user's request specifically implies a time constraint (e.g. 'latest,' 'this year,' 'recent news'). Leave unset for general or timeless questions."
+                        }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            }
+        }
+    ]
+}

@@ -1,3 +1,5 @@
 .env
 AGENTS.md
 logs/
+agent_state.db
+prompt.md
