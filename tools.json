@@ -1,6 +1,6 @@
 {
     "tools": [
-        {   
+        {
             "type": "function",
             "function": {
                 "name": "websearch",
@@ -15,7 +15,7 @@
                         "search_depth": {
                             "type": "string",
                             "enum": ["basic", "advanced"],
-                            "description": "Only use 'advanced' after first trying 'basic' with a refined or alternative query. Escalate to 'advanced' only if you've already searched with your best query at basic depth and still haven't found a sufficient answer — advanced returns more thorough, higher-relevance content per source at higher latency and cost."
+                            "description": "Only use 'advanced' after first trying 'basic' with a refined or alternative query. Escalate to 'advanced' only if you've already searched with your best query at basic depth and still haven't found a sufficient answer."
                         },
                         "freshness": {
                             "type": "string",
@@ -24,6 +24,202 @@
                         }
                     },
                     "required": ["query"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read the contents of a file within the working directory. Use this before editing a file to see its exact current content, or when you need to inspect a file's contents to answer a question.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file, relative to the working directory root. Paths outside the working directory will be rejected."
+                        },
+                        "line_range": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "minItems": 2,
+                            "maxItems": 2,
+                            "description": "Optional [start_line, end_line] (1-indexed, inclusive) to read only part of a large file instead of the whole thing. Omit to read the entire file."
+                        }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Create a new file with the given content. This tool refuses to run if the file already exists, unless overwrite is explicitly set to true — use edit_file instead if you intend to modify an existing file's content.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file to create, relative to the working directory root. Paths outside the working directory will be rejected."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The full content to write to the new file."
+                        },
+                        "overwrite": {
+                            "type": "boolean",
+                            "description": "Set to true only if you intend to replace an existing file's entire content. Defaults to false, which causes the call to fail if the file already exists."
+                        }
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "Make a targeted change to an existing file by replacing an exact block of text with new text. This is the only tool that modifies existing file content — do not use write_file for partial changes. old_str must match the file's current content exactly, including whitespace, and must be unique within the file; if it appears more than once or isn't found, the edit is rejected rather than guessed.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file to edit, relative to the working directory root. Paths outside the working directory will be rejected."
+                        },
+                        "old_str": {
+                            "type": "string",
+                            "description": "The exact, unique block of existing text to find and replace. Read the file first to copy this exactly — do not paraphrase or guess whitespace."
+                        },
+                        "new_str": {
+                            "type": "string",
+                            "description": "The text to replace old_str with. Leave empty to delete old_str entirely."
+                        }
+                    },
+                    "required": ["path", "old_str"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_python",
+                "description": "Execute a Python code snippet and return its output. Use this for calculations, data processing, testing logic, or any task better solved by running code than reasoning about it manually. Code runs in an isolated subprocess, not in the agent's own process.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "The Python code to execute. Include print() statements for any output you need to see — return values are not automatically captured."
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Maximum seconds to allow the code to run before it's killed. Omit to use the default timeout. Only set this higher if the task genuinely requires a long-running computation."
+                        }
+                    },
+                    "required": ["code"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_url",
+                "description": "Fetch and read the full text content of a specific web page, given its URL. Use this after websearch has identified a relevant URL and you need more detail than the search snippet provided — not as a substitute for websearch when you don't already have a specific URL in mind.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The full URL of the page to fetch, including scheme (https://)."
+                        },
+                        "max_length": {
+                            "type": "integer",
+                            "description": "Maximum number of characters of extracted text to return. Omit to use the default cap. Lower this for a quick skim, raise it only if you need a long page in full."
+                        }
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_shell",
+                "description": "Run a shell command. Only commands on the pre-approved allow list (e.g. git status, pytest, pip list, ls) run immediately. Any command outside the allow list will pause and ask the user for explicit permission before running — expect that call to take longer or to be denied.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The full shell command to run, exactly as it should be executed."
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Optional working directory to run the command from, relative to the working directory root. Defaults to the root itself."
+                        }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_files",
+                "description": "Search file contents for a pattern across the working directory, like grep. Use this to locate where something is defined, used, or mentioned across multiple files — do not use read_file repeatedly to search file-by-file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "The text or regular expression to search for."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Directory to search within, relative to the working directory root. Defaults to the entire working directory root if omitted."
+                        },
+                        "file_glob": {
+                            "type": "string",
+                            "description": "Optional glob to restrict which files are searched, e.g. '*.py' or '*.md'. Omit to search all files."
+                        }
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "memory_note",
+                "description": "Save, recall, or list persistent notes stored as human-readable markdown files, not a database. Use save to record something worth remembering across sessions (a fact, preference, or decision), recall to retrieve a specific note by key, and list to see what notes already exist before deciding whether to save a duplicate.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["save", "recall", "list"],
+                            "description": "Which operation to perform. Use 'list' first if you're unsure whether a relevant note already exists, to avoid creating a duplicate."
+                        },
+                        "key": {
+                            "type": "string",
+                            "description": "The note's identifier, used as its filename. Required for save and recall; not used for list."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The markdown content to save. Required for save mode only."
+                        }
+                    },
+                    "required": ["mode"],
                     "additionalProperties": false
                 }
             }
