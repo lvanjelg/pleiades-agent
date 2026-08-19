@@ -1,9 +1,14 @@
 import json
+import re
+import shlex
+import subprocess
+import sys
 import tiktoken
 import requests
 import os
 import logging
 import uuid
+from pathlib import Path
 from dotenv import load_dotenv, dotenv_values 
 from typing import Callable, Any
 from dataclasses import dataclass, field
@@ -14,6 +19,11 @@ from enum import Enum
 load_dotenv() 
 logger = logging.getLogger(__name__)
 LOG_DIR = "logs/"
+WORKING_ROOT = Path(__file__).resolve().parent
+MAX_TOOL_OUTPUT = 8000
+MAX_SEARCH_MATCHES = 100
+ALLOWED_SHELL_COMMANDS = {"git", "pytest", "pip", "python", "python3",
+                          "ls", "cat", "echo", "pwd", "wc", "grep", "find"}
 
 with open("prompt.md", encoding="utf-8") as _prompt_file:
     SYS_PROMPT = _prompt_file.read().replace(
@@ -206,6 +216,164 @@ def websearch(query: str, search_depth: str = "basic", freshness: str | None = N
         for item in results
     ]
     return json.dumps(trimmed)
+
+
+def resolve_safe_path(relative_path: str) -> Path:
+    """Resolve a path under WORKING_ROOT and reject anything that escapes it."""
+    p = Path(relative_path)
+    if p.is_absolute():
+        raise ValueError(f"Absolute paths not allowed: {relative_path}")
+    resolved = (WORKING_ROOT / p).resolve()
+    if not resolved.is_relative_to(WORKING_ROOT.resolve()):
+        raise ValueError(f"Path escapes working directory: {relative_path}")
+    return resolved
+
+
+def _cap(text: str, limit: int = MAX_TOOL_OUTPUT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+
+
+def read_file(path: str, line_range: list[int] | None = None) -> str:
+    resolved = resolve_safe_path(path)
+    with open(resolved, encoding="utf-8") as f:
+        lines = f.readlines()
+    if line_range is not None:
+        if len(line_range) != 2:
+            raise ValueError("line_range must be [start_line, end_line]")
+        start, end = line_range
+        lines = lines[start - 1:end]
+        first = start
+    else:
+        first = 1
+    return "\n".join(f"{i:4d} | {line.rstrip()}" for i, line in enumerate(lines, start=first))
+
+
+def write_file(path: str, content: str, overwrite: bool = False) -> str:
+    resolved = resolve_safe_path(path)
+    if resolved.exists() and not overwrite:
+        raise FileExistsError(
+            f"File already exists: {path} (use edit_file or set overwrite=True)")
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    resolved.write_text(content, encoding="utf-8")
+    return f"Wrote {len(content.encode('utf-8'))} bytes to {path}"
+
+
+def edit_file(path: str, old_str: str, new_str: str = "") -> str:
+    resolved = resolve_safe_path(path)
+    content = resolved.read_text(encoding="utf-8")
+    count = content.count(old_str)
+    if count == 0:
+        raise ValueError(f"old_str not found in {path}")
+    if count > 1:
+        raise ValueError(f"old_str appears {count} times in {path}; provide more context")
+    content = content.replace(old_str, new_str, 1)
+    resolved.write_text(content, encoding="utf-8")
+    return f"Edited {path}: replaced 1 occurrence ({len(old_str)} chars -> {len(new_str)} chars)"
+
+
+def run_python(code: str, timeout: int | None = None) -> str:
+    timeout = timeout or 30
+    proc = subprocess.run([sys.executable, "-c", code],
+                          capture_output=True, text=True, timeout=timeout)
+    out = proc.stdout or ""
+    if proc.stderr:
+        out += f"\n[stderr]\n{proc.stderr}"
+    if proc.returncode != 0:
+        out += f"\n[exit code: {proc.returncode}]"
+    return _cap(out.strip()) if out.strip() else "(no output)"
+
+
+def _strip_html(html: str) -> str:
+    html = re.sub(r"(?is)<(script|style|nav|noscript)[^>]*>.*?</\1>", " ", html)
+    html = re.sub(r"(?s)<[^>]+>", " ", html)
+    html = (html.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            .replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " "))
+    return re.sub(r"[ \t]+", " ", html).strip()
+
+
+def fetch_url(url: str, max_length: int | None = None) -> str:
+    r = requests.get(url, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code} fetching {url}")
+    text = _strip_html(r.text)
+    return _cap(text, max_length or 4000)
+
+
+def run_shell(command: str, cwd: str | None = None) -> str:
+    args = shlex.split(command)
+    if not args:
+        raise ValueError("Empty command")
+    work_dir = resolve_safe_path(cwd) if cwd else WORKING_ROOT
+    if args[0] not in ALLOWED_SHELL_COMMANDS:
+        answer = input(f"Run command? (y/n): {command}\n> ")
+        if answer.strip().lower() != "y":
+            return "Permission denied by user."
+    proc = subprocess.run(args, cwd=work_dir, capture_output=True, text=True, timeout=60)
+    out = proc.stdout or ""
+    if proc.stderr:
+        out += f"\n[stderr]\n{proc.stderr}"
+    if proc.returncode != 0:
+        out += f"\n[exit code: {proc.returncode}]"
+    return _cap(out.strip()) if out.strip() else "(no output)"
+
+
+def _format_matches(matches: list[tuple[str, int, str]], truncated: bool = False) -> str:
+    lines = [f"{path}:{lineno}: {line}" for path, lineno, line in matches]
+    if truncated:
+        lines.append(f"...truncated at {MAX_SEARCH_MATCHES} matches")
+    return "\n".join(lines) if lines else "(no matches)"
+
+
+def search_files(pattern: str, path: str | None = None, file_glob: str | None = None) -> str:
+    root = resolve_safe_path(path) if path else WORKING_ROOT
+    if not root.is_dir():
+        raise ValueError(f"Not a directory: {path or WORKING_ROOT}")
+    try:
+        compiled = re.compile(pattern)
+        use_regex = True
+    except re.error:
+        compiled = None
+        use_regex = False
+    matches = []
+    for p in (root.rglob(file_glob) if file_glob else root.rglob("*")):
+        if not p.is_file():
+            continue
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                for lineno, line in enumerate(f, 1):
+                    hit = compiled.search(line) if use_regex else pattern in line
+                    if hit:
+                        matches.append((str(p.relative_to(WORKING_ROOT)), lineno, line.rstrip()))
+                        if len(matches) >= MAX_SEARCH_MATCHES:
+                            return _format_matches(matches, truncated=True)
+        except (OSError, UnicodeDecodeError):
+            continue
+    return _format_matches(matches)
+
+
+def memory_note(mode: str, key: str | None = None, content: str | None = None) -> str:
+    notes_dir = WORKING_ROOT / "memory"
+    if mode == "save":
+        if not key or content is None:
+            raise ValueError("save requires both 'key' and 'content'")
+        notes_dir.mkdir(parents=True, exist_ok=True)
+        (notes_dir / f"{key}.md").write_text(content, encoding="utf-8")
+        return f"Saved note '{key}'"
+    if mode == "recall":
+        if not key:
+            raise ValueError("recall requires 'key'")
+        note_path = notes_dir / f"{key}.md"
+        if not note_path.exists():
+            raise FileNotFoundError(f"No note found for key '{key}'")
+        return note_path.read_text(encoding="utf-8")
+    if mode == "list":
+        if not notes_dir.exists():
+            return "(no notes)"
+        notes = sorted(p.stem for p in notes_dir.iterdir() if p.suffix == ".md")
+        return "\n".join(notes) if notes else "(no notes)"
+    raise ValueError(f"Unknown mode: {mode}")
 
 
 def load_tools(tools_path: str = "tools.json",
@@ -456,7 +624,18 @@ if __name__ == "__main__":
     print(logo)
     iso_time = dt.now().isoformat()
     a = AgentHarness("qwen/qwen3.8-27b", SYS_PROMPT)
-    for tool in load_tools("tools.json", {"websearch": websearch}):
+    handlers = {
+        "websearch": websearch,
+        "read_file": read_file,
+        "write_file": write_file,
+        "edit_file": edit_file,
+        "run_python": run_python,
+        "fetch_url": fetch_url,
+        "run_shell": run_shell,
+        "search_files": search_files,
+        "memory_note": memory_note,
+    }
+    for tool in load_tools("tools.json", handlers):
         a.register_tool(tool)
     logging.basicConfig(level=logging.INFO,handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],)
     while True:
