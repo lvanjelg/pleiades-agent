@@ -480,6 +480,7 @@ class AgentState:
     
 class AgentHarness:
     def __init__(self, model, system_prompt: str = ""):
+        self.data = (requests.get("http://192.168.1.92:8080/v1/models").json())
         self.model = model
         self.wrapper = Wrapper(model)
         self.system_prompt = system_prompt
@@ -490,6 +491,8 @@ class AgentHarness:
         self.user_id = "local"
         self.state.create_session(self.session_id, self.user_id)
         self.turn = 0
+        self.context = self.data["data"][0]["context_length"]
+        self.usage = 0
 
     def register_tool(self, tool: Tool):
         self.tools[tool.name] = tool
@@ -507,6 +510,7 @@ class AgentHarness:
         self.turn += 1
         messages = [
             {"role": "system", "content": self.system_prompt},
+            *self.state.get_messages(self.session_id),
             {"role": "user", "content": user_input},
         ]
         self.state.record_message(self.session_id, self.turn, "user", user_input)
@@ -559,7 +563,7 @@ class Wrapper:
 
     def chat(self, messages: list[dict], tools: list[dict] = None) -> LLMResponse:
         try:
-            r = requests.post("http://192.168.1.92:1234/v1/chat/completions", 
+            r = requests.post("http://192.168.1.92:8080/v1/chat/completions", 
                 headers={"authorization" : "Bearer " + os.getenv("API_KEY"),},
                 json={
                     "model": self.model,
@@ -623,7 +627,7 @@ class Wrapper:
 if __name__ == "__main__":
     print(logo)
     iso_time = dt.now().isoformat()
-    a = AgentHarness("qwen/qwen3.8-27b", SYS_PROMPT)
+    a = AgentHarness("3833d0220ac862d6de38448c0cd414bd2ca29d00", SYS_PROMPT)
     handlers = {
         "websearch": websearch,
         "read_file": read_file,
