@@ -69,12 +69,12 @@ class MemoryConfig:
     keep_recent_messages: int = 8
     always_preserve_system: bool = True
 
-@dataclass
-class BudgetConfig:
-    max_tokens: int = 30_000
-    max_tool_calls: int = 25
-    max_time_seconds: float = 300.0
-    max_per_tool_calls: int = 5
+# @dataclass
+# class BudgetConfig:
+#     max_tokens: int = 32_000
+#     max_tool_calls: int = 25
+#     max_time_seconds: float = 300.0
+#     max_per_tool_calls: int = 5
 
 class ErrorType(Enum):
     TRANSIENT = "transient"
@@ -98,9 +98,11 @@ def format_tool_error(error: ToolError) -> str:
 Tracks token usage and tool calls, checks for budget limits and prevents excessive usage
 '''
 class BudgetEnforcer:
-    def __init__(self, config: BudgetConfig):
-        self.config = config
+    def __init__(self, budget: int):
+        self.budget = budget
         self.tokens_used = 0
+        self.max_tool_calls = 50
+        self.max_time = 360
         self.tool_calls_total = 0
         self.tool_calls_per_tool: dict[str, int] = {}
         self.start_time = time.time()
@@ -113,52 +115,49 @@ class BudgetEnforcer:
         self.tool_calls_per_tool[tool_name] = self.tool_calls_per_tool.get(tool_name, 0) + 1
 
     def check(self) -> str | None:
-        if self.tokens_used >= self.config.max_tokens:
-            return f"Token budget exceeded: {self.tokens_used} (limit {self.config.max_tokens})"
-        if self.tool_calls_total >= self.config.max_tool_calls:
+        if self.tokens_used >= self.budget:
+            return f"Token budget exceeded: {self.tokens_used} (limit {self.budget})"
+        if self.tool_calls_total >= self.max_tool_calls:
             return f"Tool call budget exceeded: {self.tool_calls_total}"
-        if time.time() - self.start_time >= self.config.max_time_seconds:
+        if time.time() - self.start_time >= self.max_time:
             return "Time budget exceeded"
-        for tool, count in self.tool_calls_per_tool.items():
-            if count >= self.config.max_per_tool_calls:
-                return f"Per-tool limit: '{tool}' called {count} times"
         return None
 
 
-class AgentMemory:
-    def __init__(self, config: MemoryConfig):
-        self.config = config
-        self.messages: list[dict] = []
-        self.encoder = tiktoken.encoding_for_model("gpt-5-")
+# class AgentMemory:
+#     def __init__(self, config: MemoryConfig):
+#         self.config = config
+#         self.messages: list[dict] = []
+#         self.encoder = tiktoken.encoding_for_model("gpt-5-")
 
-    def add(self, role: str, content: str, **kwargs):
-        self.messages.append({"role": role, "content": content, **kwargs})
+#     def add(self, role: str, content: str, **kwargs):
+#         self.messages.append({"role": role, "content": content, **kwargs})
 
-    def get_messages(self) -> list[dict]:
-        total = sum(len(self.encoder.encode(m.get("content", ""))) + 4 for m in self.messages)
-        if total <= self.config.max_context_tokens:
-            return self.messages
-        return self._compress()
+#     def get_messages(self) -> list[dict]:
+#         total = sum(len(self.encoder.encode(m.get("content", ""))) + 4 for m in self.messages)
+#         if total <= self.config.max_context_tokens:
+#             return self.messages
+#         return self._compress()
 
-    def _compress(self) -> list[dict]:
-        keep = self.config.keep_recent_messages
-        system_msg = None
-        if self.config.always_preserve_system:
-            system_msgs = [m for m in self.messages if m["role"] == "system"]
-            if system_msgs:
-                system_msg = system_msgs[0]
-        recent = self.messages[-keep:]
-        old = self.messages[:-keep]
-        if not old:
-            return [system_msg] + recent if system_msg else recent
-        # Summarize old messages (in production, call a cheap model like Haiku)
-        old_text = "\n".join(f"[{m['role']}]: {m.get('content', '')[:200]}" for m in old)
-        summary = " | ".join([line[:100] for line in old_text.split("\n") if any(kw in line.lower() for kw in ["tool:", "result:", "error:"])][:10])
-        compressed = [{"role": "system", "content": f"[EARLIER CONTEXT: {summary}]"}]
-        if system_msg:
-            compressed = [system_msg] + compressed
-        compressed.extend(recent)
-        return compressed
+#     def _compress(self) -> list[dict]:
+#         keep = self.config.keep_recent_messages
+#         system_msg = None
+#         if self.config.always_preserve_system:
+#             system_msgs = [m for m in self.messages if m["role"] == "system"]
+#             if system_msgs:
+#                 system_msg = system_msgs[0]
+#         recent = self.messages[-keep:]
+#         old = self.messages[:-keep]
+#         if not old:
+#             return [system_msg] + recent if system_msg else recent
+#         # Summarize old messages (in production, call a cheap model like Haiku)
+#         old_text = "\n".join(f"[{m['role']}]: {m.get('content', '')[:200]}" for m in old)
+#         summary = " | ".join([line[:100] for line in old_text.split("\n") if any(kw in line.lower() for kw in ["tool:", "result:", "error:"])][:10])
+#         compressed = [{"role": "system", "content": f"[EARLIER CONTEXT: {summary}]"}]
+#         if system_msg:
+#             compressed = [system_msg] + compressed
+#         compressed.extend(recent)
+#         return compressed
 
 class ToolRegistry:
     def __init__(self):
@@ -492,7 +491,9 @@ class AgentHarness:
         self.state.create_session(self.session_id, self.user_id)
         self.turn = 0
         self.context = self.data["data"][0]["context_length"]
-        self.usage = 0
+        self.input = 0
+        self.output = 0
+        self.budgeter = BudgetEnforcer(self.context)
 
     def register_tool(self, tool: Tool):
         self.tools[tool.name] = tool
@@ -526,6 +527,9 @@ class AgentHarness:
                 self.session_id, self.turn, "assistant", response.content or "",
                 tool_calls=response.message.get("tool_calls") if isinstance(response.message, dict) else None,
             )
+            self.input += response.stats["prompt_tokens"]
+            self.output += response.stats["completion_tokens"]
+            self.budgeter.tokens_used = response.stats["prompt_tokens"]
             if not response.tool_calls:
                 return response.content
             messages.append(response.message)
@@ -569,8 +573,7 @@ class Wrapper:
                     "model": self.model,
                     "messages": messages,
                     "tools": tools,
-                },
-                timeout=300)
+                })
         except requests.exceptions.RequestException as e:
             return self._error_response(f"Request to LLM server failed: {e}")
         return self.parse_response(r)
@@ -650,3 +653,5 @@ if __name__ == "__main__":
             break
         response = a.run(user_in)
         print(response)
+        print("-"*50)
+        print(f"In :{a.input} | Out :{a.output}")
