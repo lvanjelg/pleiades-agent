@@ -4,4 +4,5 @@ logs/
 agent_state.db
 prompt.md
 __pycache__
-pleiades-vault/.DS_Store
+pleiades-vault/
+.DS_Store
