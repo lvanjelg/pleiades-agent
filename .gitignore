@@ -3,3 +3,4 @@ AGENTS.md
 logs/
 agent_state.db
 prompt.md
+__pycache__

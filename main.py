@@ -7,6 +7,7 @@ import tiktoken
 import requests
 import os
 import logging
+from pathlib import Path
 import uuid
 from pathlib import Path
 from dotenv import load_dotenv, dotenv_values 
@@ -22,13 +23,15 @@ LOG_DIR = "logs/"
 WORKING_ROOT = Path(__file__).resolve().parent
 MAX_TOOL_OUTPUT = 8000
 MAX_SEARCH_MATCHES = 100
+CONTEXT_COMPRESS_THRESHOLD = 0.85
 ALLOWED_SHELL_COMMANDS = {"git", "pytest", "pip", "python", "python3",
                           "ls", "cat", "echo", "pwd", "wc", "grep", "find"}
-
+SKILLS_DIR = "skills/"
+SUBAGENT_MAX_DEPTH = 3
+AGENTS_DIR = "agents/"
 with open("prompt.md", encoding="utf-8") as _prompt_file:
     SYS_PROMPT = _prompt_file.read().replace(
         "{current_date}", dt.now().date().isoformat())
-
 logo = r"""
 ██████╗ ██╗     ███████╗██╗ █████╗ ██████╗ ███████╗███████╗
 ██╔══██╗██║     ██╔════╝██║██╔══██╗██╔══██╗██╔════╝██╔════╝
@@ -62,19 +65,6 @@ class Tool:
     description: str
     parameters: dict  # JSON Schema
     fn: Callable
-
-@dataclass
-class MemoryConfig:
-    max_context_tokens: int = 64_000
-    keep_recent_messages: int = 8
-    always_preserve_system: bool = True
-
-# @dataclass
-# class BudgetConfig:
-#     max_tokens: int = 32_000
-#     max_tool_calls: int = 25
-#     max_time_seconds: float = 300.0
-#     max_per_tool_calls: int = 5
 
 class ErrorType(Enum):
     TRANSIENT = "transient"
@@ -123,41 +113,6 @@ class BudgetEnforcer:
             return "Time budget exceeded"
         return None
 
-
-# class AgentMemory:
-#     def __init__(self, config: MemoryConfig):
-#         self.config = config
-#         self.messages: list[dict] = []
-#         self.encoder = tiktoken.encoding_for_model("gpt-5-")
-
-#     def add(self, role: str, content: str, **kwargs):
-#         self.messages.append({"role": role, "content": content, **kwargs})
-
-#     def get_messages(self) -> list[dict]:
-#         total = sum(len(self.encoder.encode(m.get("content", ""))) + 4 for m in self.messages)
-#         if total <= self.config.max_context_tokens:
-#             return self.messages
-#         return self._compress()
-
-#     def _compress(self) -> list[dict]:
-#         keep = self.config.keep_recent_messages
-#         system_msg = None
-#         if self.config.always_preserve_system:
-#             system_msgs = [m for m in self.messages if m["role"] == "system"]
-#             if system_msgs:
-#                 system_msg = system_msgs[0]
-#         recent = self.messages[-keep:]
-#         old = self.messages[:-keep]
-#         if not old:
-#             return [system_msg] + recent if system_msg else recent
-#         # Summarize old messages (in production, call a cheap model like Haiku)
-#         old_text = "\n".join(f"[{m['role']}]: {m.get('content', '')[:200]}" for m in old)
-#         summary = " | ".join([line[:100] for line in old_text.split("\n") if any(kw in line.lower() for kw in ["tool:", "result:", "error:"])][:10])
-#         compressed = [{"role": "system", "content": f"[EARLIER CONTEXT: {summary}]"}]
-#         if system_msg:
-#             compressed = [system_msg] + compressed
-#         compressed.extend(recent)
-#         return compressed
 
 class ToolRegistry:
     def __init__(self):
@@ -396,7 +351,77 @@ def load_tools(tools_path: str = "tools.json",
     return tools
 
 
-    
+
+
+def load_subagents(agents_dir: str = AGENTS_DIR) -> dict:
+    """Load sub-agent configs from agents/*.md files (frontmatter + body).
+
+    Each file opens with YAML-style frontmatter between --- fences:
+        name, description, tools (comma list), spawn (comma list, optional)
+    The markdown body becomes the agent's system_prompt, so editing these
+    files is how you tune sub-agent instructions.
+    """
+    agents: dict[str, dict] = {}
+    agents_path = Path(agents_dir)
+    if not agents_path.is_dir():
+        return agents
+    for md_file in sorted(agents_path.glob("*.md")):
+        text = md_file.read_text(encoding="utf-8")
+        if not text.startswith("---"):
+            continue
+        parts = text.split("\n---", 1)
+        if len(parts) != 2:
+            continue
+        frontmatter, body = parts
+        fields = {}
+        for line in frontmatter.splitlines()[1:]:
+            if ":" in line:
+                key, _, value = line.partition(":")
+                fields[key.strip()] = value.strip()
+        name = fields.get("name")
+        if not name:
+            continue
+        agents[name] = {
+            "description": fields.get("description", ""),
+            "system_prompt": body.strip(),
+            "tools": [t.strip() for t in fields.get("tools", "").split(",") if t.strip()],
+            "spawn": [s.strip() for s in fields.get("spawn", "").split(",") if s.strip()],
+        }
+    return agents
+
+
+SUBAGENTS = load_subagents()
+
+
+def load_skills(skills_dir: str = SKILLS_DIR) -> dict:
+    skills: dict[str, dict] = {}
+    skills_path = Path(skills_dir)
+    if not skills_path.is_dir():
+        return skills
+    for skill in os.scandir(skills_path):
+        for md_file in Path(skill).glob('**/*.*'):
+            text = md_file.read_text(encoding="utf-8")
+            if not text.startswith("---"):
+                continue
+            parts = text.split("\n---", 1)
+            if len(parts) != 2:
+                continue
+            frontmatter, body = parts
+            fields = {}
+            for line in frontmatter.splitlines()[1:]:
+                if ":" in line:
+                    key, _, value = line.partition(":")
+                    fields[key.strip()] = value.strip()
+            name = fields.get("name")
+            if not name:
+                continue
+            skills[name] = {
+                "description": fields.get("description", ""),
+            }
+    return skills
+
+SKILLS = load_skills()
+
 '''
 Creates agent DB with SQLite to track sessions and tool invocations and provide analytics
 '''
@@ -484,6 +509,7 @@ class AgentHarness:
         self.wrapper = Wrapper(model)
         self.system_prompt = system_prompt
         self.tools: dict[str, Tool] = {}
+        self.skills: dict[str, dict] = SKILLS
         self.max_iterations = 100
         self.state = AgentState()
         self.session_id = str(uuid.uuid4())
@@ -491,9 +517,12 @@ class AgentHarness:
         self.state.create_session(self.session_id, self.user_id)
         self.turn = 0
         self.context = self.data["data"][0]["context_length"]
+        self.usage = 0
         self.input = 0
         self.output = 0
         self.budgeter = BudgetEnforcer(self.context)
+        self.messages: list[dict] = []
+        self.keep_msg_count = 8
 
     def register_tool(self, tool: Tool):
         self.tools[tool.name] = tool
@@ -507,6 +536,38 @@ class AgentHarness:
             for t in self.tools.values()
         ]
 
+    def add(self, role: str, content: str, **kwargs):
+        self.messages.append({"role": role, "content": content, **kwargs})
+
+    def get_messages(self) -> list[dict]:
+        # budgeter.tokens_used = the last context size the API reported (usage.prompt_tokens)
+        if self.budgeter.tokens_used >= int(self.context * CONTEXT_COMPRESS_THRESHOLD):
+            return self._compress()
+        return list(self.messages)
+
+    def _compress(self) -> list[dict]:
+        keep = self.keep_msg_count
+        sys_msgs = [m for m in self.messages if m.get("role") == "system"]
+        system_msg = sys_msgs[0] if sys_msgs else None
+        others = [m for m in self.messages if m.get("role") != "system"]
+        recent = others[-keep:]
+        old = others[:-keep]
+        if not old:
+            return [system_msg] + recent if system_msg else list(recent)
+        lines = []
+        for m in old:
+            content = (m.get("content") or "").replace("\n", " ").strip()
+            label = f"[{m.get('role')}]"
+            if m.get("role") == "tool":
+                label += f":{m.get('name', 'tool')}"
+            lines.append(f"{label}: {content[:200]}")
+        summary_text = "EARLIER CONTEXT: " + " | ".join(lines)[:1500]
+        if system_msg:
+            merged = dict(system_msg)
+            merged["content"] = f"{system_msg.get('content', '')}\n\n{summary_text}"
+            return [merged] + recent
+        return [{"role": "system", "content": summary_text}] + recent
+
     def run(self, user_input: str) -> str:
         self.turn += 1
         messages = [
@@ -517,7 +578,7 @@ class AgentHarness:
         self.state.record_message(self.session_id, self.turn, "user", user_input)
         for i in range(self.max_iterations):
             response = self.wrapper.chat(
-                messages=messages, tools=self.tool_list() if self.tools else None,
+                messages=messages, tools=self.tool_list() if self.tools else None, skills = self.skills,
             )
             logger.info(response)
             reasoning = response.message.get("reasoning_content", "") if isinstance(response.message, dict) else ""
@@ -530,6 +591,7 @@ class AgentHarness:
             self.input += response.stats["prompt_tokens"]
             self.output += response.stats["completion_tokens"]
             self.budgeter.tokens_used = response.stats["prompt_tokens"]
+            self.usage = response.stats["prompt_tokens"]
             if not response.tool_calls:
                 return response.content
             messages.append(response.message)
@@ -556,16 +618,55 @@ class AgentHarness:
                 messages.append({"role": "tool", "content": str(result), "tool_call_id": call.call_id})
         return "Max iterations reached."
 
-'''
-Wrapper.chat(messages, tools) → HTTP POST → local LLM → parse response → return object with .content / .tool_calls / .message
-'''
+    def run_subagent(self, agent: str, task: str, _from: str | None = None, _depth: int = 0) -> str:
+        if agent not in SUBAGENTS:
+            return f"Error: Unknown subagent '{agent}'. Available: {', '.join(SUBAGENTS)}"
+        if _from is not None and agent not in SUBAGENTS[_from]["spawn"]:
+            return f"Error: '{_from}' may not spawn '{agent}'"
+        if _depth >= SUBAGENT_MAX_DEPTH:
+            return "Subagent depth limit reached."
+        cfg = SUBAGENTS[agent]
+        allowed = {name: t for name, t in self.tools.items() if name in cfg["tools"]}
+        schemas = [
+            {"type": "function", "function": {
+                "name": t.name, "description": t.description,
+                "parameters": t.parameters,
+            }}
+            for t in allowed.values()
+        ]
+        messages = [
+            {"role": "system", "content": cfg["system_prompt"]},
+            {"role": "user", "content": task},
+        ]
+        for _ in range(self.max_iterations):
+            response = self.wrapper.chat(messages=messages, tools=schemas or None)
+            logger.info(response)
+            if not response.tool_calls:
+                return response.content or "(no output)"
+            messages.append(response.message)
+            for call in response.tool_calls:
+                if call.name == "subagent":
+                    result = self.run_subagent(
+                        agent=call.args.get("agent", ""), task=call.args.get("task", ""),
+                        _from=agent, _depth=_depth + 1)
+                else:
+                    tool = allowed.get(call.name)
+                    if not tool:
+                        result = f"Error: tool '{call.name}' not available to '{agent}'"
+                    else:
+                        try:
+                            result = tool.fn(**call.args)
+                        except Exception as e:
+                            result = f"Error: {type(e).__name__}: {e}"
+                messages.append({"role": "tool", "content": str(result), "tool_call_id": call.call_id})
+        return "Subagent max iterations reached."
 
 class Wrapper:
     def __init__(self, model):
         self.model = model
         self.tool_id = 1
 
-    def chat(self, messages: list[dict], tools: list[dict] = None) -> LLMResponse:
+    def chat(self, messages: list[dict], tools: list[dict] = None, skills: dict = None) -> LLMResponse:
         try:
             r = requests.post("http://192.168.1.92:8080/v1/chat/completions", 
                 headers={"authorization" : "Bearer " + os.getenv("API_KEY"),},
@@ -573,6 +674,7 @@ class Wrapper:
                     "model": self.model,
                     "messages": messages,
                     "tools": tools,
+                    "skills": skills,
                 })
         except requests.exceptions.RequestException as e:
             return self._error_response(f"Request to LLM server failed: {e}")
@@ -641,11 +743,13 @@ if __name__ == "__main__":
         "run_shell": run_shell,
         "search_files": search_files,
         "memory_note": memory_note,
+        "subagent": a.run_subagent,
     }
     for tool in load_tools("tools.json", handlers):
         a.register_tool(tool)
     logging.basicConfig(level=logging.INFO,handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],)
     while True:
+        pass
         print("-"*50)
         user_in = input("> ")
         logger.info(user_in)
@@ -654,4 +758,4 @@ if __name__ == "__main__":
         response = a.run(user_in)
         print(response)
         print("-"*50)
-        print(f"In :{a.input} | Out :{a.output}")
+        print(f"In {a.input} | Out {a.output}")

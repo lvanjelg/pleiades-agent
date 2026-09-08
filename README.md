@@ -1,16 +1,16 @@
-1. Message history + SQL store
+1. Message history + SQL store √
 
 Ordered message log per conversation (role, content, tool calls, timestamp, token count). The foundation everything else reads from and writes to. ConversationStore interface so this can later be swapped/extended without touching the core loop.
 
-2. Tool registry (static)
+2. Tool registry (static) √
 
 Name → JSON schema → callable, with register/list/invoke. Hand-written tools only at this stage — no dynamic creation yet. Establishes the pattern (registry + schema validation) that skills, SOPs, and self-created artifacts will all reuse.
 
-3. Budgeting system
+3. Budgeting system √
 
 Tokenizer-accurate running count per conversation, plus an eviction policy (drop oldest, summarize-and-evict, or retrieve-relevant-only) for when approaching the context limit. Built early because every subsystem after this consumes budget, and it later doubles as the burn-rate signal for spiral detection.
 
-4. Global traits
+4. Global traits √
 
 The small, always-on rule set that isn't task-specific — Socratic style, no-unsolicited-code, verbosity defaults. Implemented as a static system-prompt fragment, sitting beneath everything else. Built now, before skills/personas exist, so it's a stable baseline you can check later additions against ("did this skill/persona override a global trait").
 

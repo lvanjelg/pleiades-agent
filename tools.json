@@ -223,6 +223,29 @@
                     "additionalProperties": false
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "subagent",
+                "description": "Dispatch a task to an isolated sub-agent that runs with a fresh context containing only the task you write — it has no memory of this conversation, so write it self-contained. Choose the agent by work type: 'scout' for fast codebase reconnaissance, 'researcher' for web research, or 'worker' for implementing code changes (worker may itself dispatch scout/researcher). Sub-agents return text only; if you need artifacts, ask the sub-agent to write them and return the paths. Delegate large investigations here rather than consuming your own context.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent": {
+                            "type": "string",
+                            "enum": ["scout", "researcher", "worker"],
+                            "description": "Which sub-agent to run: 'scout' for codebase reconnaissance, 'researcher' for web research, or 'worker' for making code changes (worker may delegate further to scout/researcher)."
+                        },
+                        "task": {
+                            "type": "string",
+                            "description": "A fully self-contained task description. The sub-agent has no access to this conversation, so include the goal, any relevant constraints or context, and exactly what to return (e.g. findings with file:line references, a summary citing source URLs, or a report of the changes made)."
+                        }
+                    },
+                    "required": ["agent", "task"],
+                    "additionalProperties": false
+                }
+            }
         }
     ]
 }
