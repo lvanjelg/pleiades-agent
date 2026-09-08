@@ -3,7 +3,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tiktoken
 import requests
 import os
 import logging
@@ -172,12 +171,24 @@ def websearch(query: str, search_depth: str = "basic", freshness: str | None = N
     return json.dumps(trimmed)
 
 
-def resolve_safe_path(relative_path: str) -> Path:
-    """Resolve a path under WORKING_ROOT and reject anything that escapes it."""
-    p = Path(relative_path)
-    if p.is_absolute():
+def resolve_safe_path(relative_path: str, vault_root: str | None = None) -> Path:
+    """Resolve a path under WORKING_ROOT and reject anything that escapes it.
+    If vault_root is provided and relative path is Obsidian-style (relative to vault),
+    resolve to {vault_root}/{relative_path} instead of working dir.
+    """
+    # If it looks like an absolute path (starts with / or /), reject it
+    if Path(relative_path).is_absolute():
         raise ValueError(f"Absolute paths not allowed: {relative_path}")
-    resolved = (WORKING_ROOT / p).resolve()
+    
+    if vault_root:
+        resolved = (Path(vault_root) / relative_path).resolve()
+        # Verify it's under the vault_root
+        expected_resolved = (Path(vault_root) / relative_path).resolve()
+        if resolved.is_relative_to(expected_resolved):
+            return resolved
+    
+    # Fall back to working directory resolution
+    resolved = (WORKING_ROOT / relative_path).resolve()
     if not resolved.is_relative_to(WORKING_ROOT.resolve()):
         raise ValueError(f"Path escapes working directory: {relative_path}")
     return resolved
@@ -259,12 +270,45 @@ def run_shell(command: str, cwd: str | None = None) -> str:
     args = shlex.split(command)
     if not args:
         raise ValueError("Empty command")
-    work_dir = resolve_safe_path(cwd) if cwd else WORKING_ROOT
+    # Determine effective working directory
+    if cwd:
+        if "vault_root" in command or "root_dir" in command:
+            effective_cwd = cwd.split("vault_root")[-1].split("root_dir")[-1].strip()
+            effective_cwd = effective_cwd or cwd.split("vault_root=")[1].split("root_dir=")[-1]
+        else:
+            effective_cwd = cwd
+    elif "vault_root" in os.environ.get("VAULT_ROOT", "").strip():
+        effective_cwd = os.environ["VAULT_ROOT"].strip()
+    else:
+        effective_cwd = WORKING_ROOT
+    
+    # Override work_dir with the effective directory
+    resolved_cwd = resolve_safe_path(effective_cwd)
+    work_dir = resolved_cwd if cwd else resolved_cwd
+    
     if args[0] not in ALLOWED_SHELL_COMMANDS:
         answer = input(f"Run command? (y/n): {command}\n> ")
         if answer.strip().lower() != "y":
             return "Permission denied by user."
     proc = subprocess.run(args, cwd=work_dir, capture_output=True, text=True, timeout=60)
+    out = proc.stdout or ""
+    if proc.stderr:
+        out += f"\n[stderr]\n{proc.stderr}"
+    if proc.returncode != 0:
+        out += f"\n[exit code: {proc.returncode}]"
+    return _cap(out.strip()) if out.strip() else "(no output)"
+
+
+def run_bash(command: str, cwd: str | None = None) -> str:
+    """Run a real bash command (shell=True): pipelines, &&, redirects, globs, and
+    compound commands all work. Unlike run_shell there is no allow-list gate or
+    blocking prompt — the harness runs the command as-is. Use this for anything
+    that needs actual shell features or falls outside run_shell's allow list."""
+    if not command or not command.strip():
+        raise ValueError("Empty command")
+    work_dir = resolve_safe_path(cwd) if cwd else WORKING_ROOT
+    proc = subprocess.run(command, shell=True, cwd=work_dir,
+                          capture_output=True, text=True, timeout=120)
     out = proc.stdout or ""
     if proc.stderr:
         out += f"\n[stderr]\n{proc.stderr}"
@@ -280,8 +324,8 @@ def _format_matches(matches: list[tuple[str, int, str]], truncated: bool = False
     return "\n".join(lines) if lines else "(no matches)"
 
 
-def search_files(pattern: str, path: str | None = None, file_glob: str | None = None) -> str:
-    root = resolve_safe_path(path) if path else WORKING_ROOT
+def search_files(pattern: str, path: str | None = None, file_glob: str | None = None, vault_root: str | None = None) -> str:
+    root = resolve_safe_path(path, vault_root) if path else resolve_safe_path(".", vault_root)
     if not root.is_dir():
         raise ValueError(f"Not a directory: {path or WORKING_ROOT}")
     try:
@@ -291,7 +335,7 @@ def search_files(pattern: str, path: str | None = None, file_glob: str | None = 
         compiled = None
         use_regex = False
     matches = []
-    for p in (root.rglob(file_glob) if file_glob else root.rglob("*")):
+    for p in (root.rglob(file_glob) if file_glob else root.rglob("")):
         if not p.is_file():
             continue
         try:
@@ -299,7 +343,12 @@ def search_files(pattern: str, path: str | None = None, file_glob: str | None = 
                 for lineno, line in enumerate(f, 1):
                     hit = compiled.search(line) if use_regex else pattern in line
                     if hit:
-                        matches.append((str(p.relative_to(WORKING_ROOT)), lineno, line.rstrip()))
+                        # Path should be relative to vault_root for Obsidian-style paths
+                        if vault_root:
+                            rel = p.relative_to(Path(vault_root))
+                        else:
+                            rel = p.relative_to(WORKING_ROOT)
+                        matches.append((str(rel), lineno, line.rstrip()))
                         if len(matches) >= MAX_SEARCH_MATCHES:
                             return _format_matches(matches, truncated=True)
         except (OSError, UnicodeDecodeError):
@@ -307,14 +356,16 @@ def search_files(pattern: str, path: str | None = None, file_glob: str | None = 
     return _format_matches(matches)
 
 
-def memory_note(mode: str, key: str | None = None, content: str | None = None) -> str:
-    notes_dir = WORKING_ROOT / "memory"
+def memory_note(mode: str, key: str | None = None, content: str | None = None, vault_root: str | None = None) -> str:
+    if vault_root is None:
+        vault_root = getattr(getattr(__import__("main"), "main"), "AgentState" if False else None)
+    notes_dir = resolve_safe_path("memory", vault_root) if vault_root else (WORKING_ROOT / "memory")
     if mode == "save":
         if not key or content is None:
             raise ValueError("save requires both 'key' and 'content'")
         notes_dir.mkdir(parents=True, exist_ok=True)
         (notes_dir / f"{key}.md").write_text(content, encoding="utf-8")
-        return f"Saved note '{key}'"
+        return f"Saved note '{key}' to {notes_dir / f'{key}.md'}"
     if mode == "recall":
         if not key:
             raise ValueError("recall requires 'key'")
@@ -393,8 +444,8 @@ def load_subagents(agents_dir: str = AGENTS_DIR) -> dict:
 SUBAGENTS = load_subagents()
 
 
-def load_skills(skills_dir: str = SKILLS_DIR) -> dict:
-    skills: dict[str, dict] = {}
+def load_skills(skills_dir: str = SKILLS_DIR) -> str:
+    skills: str = ""
     skills_path = Path(skills_dir)
     if not skills_path.is_dir():
         return skills
@@ -412,13 +463,9 @@ def load_skills(skills_dir: str = SKILLS_DIR) -> dict:
                 if ":" in line:
                     key, _, value = line.partition(":")
                     fields[key.strip()] = value.strip()
-            name = fields.get("name")
-            if not name:
-                continue
-            skills[name] = {
-                "description": fields.get("description", ""),
-            }
-    return skills
+            if fields.get("name") and fields.get("description"):
+                skills += f"{fields['name']}: {fields['description']}\n"
+    return skills.strip()
 
 SKILLS = load_skills()
 
@@ -426,7 +473,8 @@ SKILLS = load_skills()
 Creates agent DB with SQLite to track sessions and tool invocations and provide analytics
 '''
 class AgentState:
-    def __init__(self, db_path: str = "agent_state.db"):
+    def __init__(self, db_path: str = "agent_state.db", vault_root: str | None = None):
+        self.vault_root = vault_root
         self.db = sqlite3.connect(db_path)
         self.db.execute("""CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY, created_at TEXT,
@@ -509,7 +557,7 @@ class AgentHarness:
         self.wrapper = Wrapper(model)
         self.system_prompt = system_prompt
         self.tools: dict[str, Tool] = {}
-        self.skills: dict[str, dict] = SKILLS
+        self.skills: str = SKILLS
         self.max_iterations = 100
         self.state = AgentState()
         self.session_id = str(uuid.uuid4())
@@ -568,17 +616,22 @@ class AgentHarness:
             return [merged] + recent
         return [{"role": "system", "content": summary_text}] + recent
 
-    def run(self, user_input: str) -> str:
+    def run(self, user_input: str, root_dir: str | None = None) -> str:
+        # Use root_dir if provided, otherwise fallback to vault_root from AgentState
+        effective_vault_root = root_dir or getattr(self.state, "vault_root", "pleiades")
+        self.vault_root = effective_vault_root
+        
         self.turn += 1
         messages = [
             {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": self.skills},
             *self.state.get_messages(self.session_id),
             {"role": "user", "content": user_input},
         ]
         self.state.record_message(self.session_id, self.turn, "user", user_input)
         for i in range(self.max_iterations):
             response = self.wrapper.chat(
-                messages=messages, tools=self.tool_list() if self.tools else None, skills = self.skills,
+                messages=messages, tools=self.tool_list() if self.tools else None,
             )
             logger.info(response)
             reasoning = response.message.get("reasoning_content", "") if isinstance(response.message, dict) else ""
@@ -674,7 +727,6 @@ class Wrapper:
                     "model": self.model,
                     "messages": messages,
                     "tools": tools,
-                    "skills": skills,
                 })
         except requests.exceptions.RequestException as e:
             return self._error_response(f"Request to LLM server failed: {e}")
@@ -742,6 +794,7 @@ if __name__ == "__main__":
         "fetch_url": fetch_url,
         "run_shell": run_shell,
         "search_files": search_files,
+        "bash": run_bash,
         "memory_note": memory_note,
         "subagent": a.run_subagent,
     }

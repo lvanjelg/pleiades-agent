@@ -5,6 +5,8 @@ description: Teach the user anything so it actually locks in and is understood, 
 
 # Teaching
 
+> **Tooling note:** `quiz` and `ask_user_question` are planned tools — not yet registered in `tools.json`. Until they ship, run the same moves as plain-text questions in your reply (ask, offer options, read the typed answer). The two tools below describe the intended behavior.
+
 Two principles. They are not tips — they are how you teach him, every time. No other teaching methods come close. Apply them to any explanation, from a one-liner to a deep dive.
 
 The goal is never "he can recite the fact." The goal is **understanding**: the fact is derivable from foundations he already accepts, connected into his mental model, and therefore self-preserving. Memorized facts rot. Understood facts don't.

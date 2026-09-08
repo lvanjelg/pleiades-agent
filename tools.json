@@ -153,13 +153,35 @@
             "type": "function",
             "function": {
                 "name": "run_shell",
-                "description": "Run a shell command. Only commands on the pre-approved allow list (e.g. git status, pytest, pip list, ls) run immediately. Any command outside the allow list will pause and ask the user for explicit permission before running — expect that call to take longer or to be denied.",
+                "description": "Run a single command from the pre-approved allow list (git, pytest, pip, python, ls, cat, echo, pwd, wc, grep, find). Runs immediately with no prompting. Use for simple, safe checks only; for anything needing pipes, &&, redirects, globs, or arbitrary commands use 'bash' instead. Execute the command yourself — never ask the user to run commands for you.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "command": {
                             "type": "string",
                             "description": "The full shell command to run, exactly as it should be executed."
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Optional working directory to run the command from, relative to the working directory root. Defaults to the root itself."
+                        }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "description": "Run a real bash command with full shell semantics: pipes (|), chaining (&& / ;), redirects (>), globs (*), and compound commands all work. Runs the command as-is without a confirmation prompt. Use this whenever you need actual shell power or a command outside run_shell's allow list (e.g. 'ls skills/ | wc -l', 'cd ../somewhere && ls'). Execute the command yourself and report the output — never ask the user to run commands for you, and never output bash code blocks as a substitute for actually running them.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The full bash command to execute, exactly as written. Shell syntax (pipes, &&, redirects, globs, quoting) is supported."
                         },
                         "cwd": {
                             "type": "string",
@@ -228,18 +250,18 @@
             "type": "function",
             "function": {
                 "name": "subagent",
-                "description": "Dispatch a task to an isolated sub-agent that runs with a fresh context containing only the task you write — it has no memory of this conversation, so write it self-contained. Choose the agent by work type: 'scout' for fast codebase reconnaissance, 'researcher' for web research, or 'worker' for implementing code changes (worker may itself dispatch scout/researcher). Sub-agents return text only; if you need artifacts, ask the sub-agent to write them and return the paths. Delegate large investigations here rather than consuming your own context.",
+                "description": "Dispatch a task to an isolated sub-agent that runs with a fresh context containing only the task you write — it has no memory of this conversation, so write it self-contained. Choose the agent by work type: 'scout' for fast codebase reconnaissance, 'researcher' for web research, 'worker' for implementing code changes (worker may itself dispatch scout/researcher), 'mermaid-maker' for authoring and rendering a structural/relational diagram, or 'svg-maker' for a spatial/geometric picture. Sub-agents return text only; if you need artifacts, ask the sub-agent to write them and return the paths. Delegate large investigations here rather than consuming your own context.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "agent": {
                             "type": "string",
-                            "enum": ["scout", "researcher", "worker"],
-                            "description": "Which sub-agent to run: 'scout' for codebase reconnaissance, 'researcher' for web research, or 'worker' for making code changes (worker may delegate further to scout/researcher)."
+                            "enum": ["scout", "researcher", "worker", "mermaid-maker", "svg-maker"],
+                            "description": "Which sub-agent to run: 'scout' for codebase reconnaissance, 'researcher' for web research, 'worker' for making code changes (worker may delegate further to scout/researcher), 'mermaid-maker' for rendering a structural/relational diagram (writes a .mmd source with write_file, renders via run_shell, saves the PNG under viz/), or 'svg-maker' for a spatial/geometric diagram (hand-written SVG, rendered via run_shell, saved under viz/)."
                         },
                         "task": {
                             "type": "string",
-                            "description": "A fully self-contained task description. The sub-agent has no access to this conversation, so include the goal, any relevant constraints or context, and exactly what to return (e.g. findings with file:line references, a summary citing source URLs, or a report of the changes made)."
+                            "description": "A fully self-contained task description. The sub-agent has no access to this conversation, so include the goal, any relevant constraints or context, and exactly what to return (e.g. findings with file:line references, a summary citing source URLs, a report of changes made, or a RESULT block with the published filename and path)."
                         }
                     },
                     "required": ["agent", "task"],
