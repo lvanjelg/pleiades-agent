@@ -475,7 +475,10 @@ Creates agent DB with SQLite to track sessions and tool invocations and provide 
 class AgentState:
     def __init__(self, db_path: str = "agent_state.db", vault_root: str | None = None):
         self.vault_root = vault_root
-        self.db = sqlite3.connect(db_path)
+        # The TUI runs harness.run() on a worker thread while AgentState is created
+        # on the main thread. Only one turn runs at a time, so relaxing the
+        # same-thread check is safe here.
+        self.db = sqlite3.connect(db_path, check_same_thread=False)
         self.db.execute("""CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY, created_at TEXT,
             last_active TEXT, user_id TEXT)""")
@@ -551,8 +554,9 @@ class AgentState:
 
     
 class AgentHarness:
-    def __init__(self, model, system_prompt: str = ""):
+    def __init__(self, model, system_prompt: str = "", event_bus=None):
         self.data = (requests.get("http://192.168.1.92:8080/v1/models").json())
+        self.bus = event_bus
         self.model = model
         self.wrapper = Wrapper(model)
         self.system_prompt = system_prompt
@@ -571,6 +575,15 @@ class AgentHarness:
         self.budgeter = BudgetEnforcer(self.context)
         self.messages: list[dict] = []
         self.keep_msg_count = 8
+
+    # -- decoupled UX events (README step 13) ---------------------------
+    def _emit(self, kind: str, **data) -> None:
+        """Emit a state event to the attached EventBus (no-op without one)."""
+        if self.bus is not None:
+            try:
+                self.bus.emit_kind(kind, **data)
+            except Exception:
+                pass
 
     def register_tool(self, tool: Tool):
         self.tools[tool.name] = tool
@@ -622,6 +635,7 @@ class AgentHarness:
         self.vault_root = effective_vault_root
         
         self.turn += 1
+        self._emit("user", content=user_input)
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "system", "content": self.skills},
@@ -630,9 +644,21 @@ class AgentHarness:
         ]
         self.state.record_message(self.session_id, self.turn, "user", user_input)
         for i in range(self.max_iterations):
-            response = self.wrapper.chat(
-                messages=messages, tools=self.tool_list() if self.tools else None,
-            )
+            self._emit("thinking", iteration=i)
+            streamed = {"tokens": 0}
+            if self.bus is not None:
+                def _on_token(text, _s=streamed):
+                    _s["tokens"] += 1
+                    self._emit("token", text=text)
+                response = self.wrapper.chat_streamed(
+                    messages=messages,
+                    tools=self.tool_list() if self.tools else None,
+                    on_token=_on_token,
+                )
+            else:
+                response = self.wrapper.chat(
+                    messages=messages, tools=self.tool_list() if self.tools else None,
+                )
             logger.info(response)
             reasoning = response.message.get("reasoning_content", "") if isinstance(response.message, dict) else ""
             logger.info("[reasoning]" + reasoning)
@@ -641,14 +667,18 @@ class AgentHarness:
                 self.session_id, self.turn, "assistant", response.content or "",
                 tool_calls=response.message.get("tool_calls") if isinstance(response.message, dict) else None,
             )
-            self.input += response.stats["prompt_tokens"]
-            self.output += response.stats["completion_tokens"]
-            self.budgeter.tokens_used = response.stats["prompt_tokens"]
-            self.usage = response.stats["prompt_tokens"]
+            self.input += response.stats.get("prompt_tokens", 0)
+            self.output += response.stats.get("completion_tokens", 0)
+            self.budgeter.tokens_used = response.stats.get("prompt_tokens", 0)
+            self.usage = response.stats.get("prompt_tokens", 0)
+            if self.bus is not None and response.content and streamed["tokens"] == 0:
+                self._emit("message", content=response.content)
             if not response.tool_calls:
+                self._emit("done", content=response.content or "")
                 return response.content
             messages.append(response.message)
             for call in response.tool_calls:
+                self._emit("tool_call", call_id=str(call.call_id), name=call.name, args=call.args)
                 tool = self.tools.get(call.name)
                 start = time.monotonic()
                 if not tool:
@@ -668,7 +698,11 @@ class AgentHarness:
                 self.state.record_message(
                     self.session_id, self.turn, "tool", str(result),
                     tool_name=call.name, tool_call_id=str(call.call_id))
+                self._emit("tool_result", call_id=str(call.call_id), name=call.name,
+                           success=success, duration_ms=duration_ms,
+                           preview=str(result)[:600] if result else "")
                 messages.append({"role": "tool", "content": str(result), "tool_call_id": call.call_id})
+        self._emit("done", content="Max iterations reached.")
         return "Max iterations reached."
 
     def run_subagent(self, agent: str, task: str, _from: str | None = None, _depth: int = 0) -> str:
@@ -714,6 +748,72 @@ class AgentHarness:
                 messages.append({"role": "tool", "content": str(result), "tool_call_id": call.call_id})
         return "Subagent max iterations reached."
 
+def _iter_sse_json(lines):
+    """Yield parsed JSON objects from an OpenAI-style SSE chat stream."""
+    for raw in lines:
+        text = raw.decode("utf-8", "replace").strip() if isinstance(raw, bytes) else (raw or "").strip()
+        if not text.startswith("data:"):
+            continue
+        payload = text[len("data:"):].strip()
+        if payload == "[DONE]":
+            return
+        try:
+            yield json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+
+def _apply_stream_event(acc: dict, event: dict) -> tuple[list[str], list[str]]:
+    """Fold one chat.completion.chunk into acc; return the (content, reasoning)
+    fragments it produced so callers can emit live 'token' events."""
+    content_tokens: list[str] = []
+    reasoning_tokens: list[str] = []
+    choices = event.get("choices") or []
+    choice0 = choices[0] if choices else {}
+    delta = choice0.get("delta") or {}
+    if delta.get("content"):
+        acc["content"].append(delta["content"])
+        content_tokens.append(delta["content"])
+    if delta.get("reasoning_content"):
+        acc["reasoning"].append(delta["reasoning_content"])
+        reasoning_tokens.append(delta["reasoning_content"])
+    for tc in delta.get("tool_calls") or []:
+        idx = tc.get("index", len(acc["tool_calls"]))
+        while len(acc["tool_calls"]) <= idx:
+            acc["tool_calls"].append({"id": None, "type": "function",
+                                      "function": {"name": "", "arguments": ""}})
+        slot = acc["tool_calls"][idx]
+        if tc.get("id"):
+            slot["id"] = tc["id"]
+        fn = tc.get("function") or {}
+        if fn.get("name"):
+            slot["function"]["name"] += fn["name"]
+        if fn.get("arguments"):
+            slot["function"]["arguments"] += fn["arguments"]
+    if choice0.get("finish_reason"):
+        acc["finish"] = choice0["finish_reason"]
+    if event.get("usage"):
+        acc["usage"] = event["usage"]
+    return content_tokens, reasoning_tokens
+
+
+def _safe_json(text: str) -> dict:
+    try:
+        parsed = json.loads(text or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _estimate_tokens(*texts: str) -> int:
+    """Rough char/4 token estimate, used only when a stream omits usage."""
+    total = 0
+    for text in texts:
+        if text:
+            total += max(1, len(text) // 4)
+    return total
+
+
 class Wrapper:
     def __init__(self, model):
         self.model = model
@@ -731,6 +831,81 @@ class Wrapper:
         except requests.exceptions.RequestException as e:
             return self._error_response(f"Request to LLM server failed: {e}")
         return self.parse_response(r)
+
+    def chat_streamed(self, messages: list[dict], tools: list[dict] = None,
+                      on_token=None, on_reasoning=None) -> LLMResponse:
+        """SSE streaming chat. Delivers content tokens to on_token as they arrive
+        and returns the SAME LLMResponse shape as chat(), so the harness loop is
+        unchanged. Falls back to chat() when the server doesn't actually stream
+        (non-SSE body), or when the request fails before any data arrives."""
+        payload = {"model": self.model, "messages": messages, "tools": tools, "stream": True}
+        try:
+            r = requests.post(
+                "http://192.168.1.92:8080/v1/chat/completions",
+                headers={"authorization": "Bearer " + os.getenv("API_KEY", "")},
+                json=payload, stream=True, timeout=(15, 600),
+            )
+        except requests.exceptions.RequestException as e:
+            return self._error_response(f"Request to LLM server failed: {e}")
+        if r.status_code != 200:
+            return self.parse_response(r)
+
+        acc = {"content": [], "reasoning": [], "tool_calls": [], "usage": {}, "finish": None}
+        saw = False
+        try:
+            for ev in _iter_sse_json(r.iter_lines()):
+                saw = True
+                content_tokens, reasoning_tokens = _apply_stream_event(acc, ev)
+                if on_token is not None:
+                    for t in content_tokens:
+                        on_token(t)
+                if on_reasoning is not None:
+                    for t in reasoning_tokens:
+                        on_reasoning(t)
+        except requests.exceptions.RequestException as e:
+            return self._error_response(f"Request to LLM server failed mid-stream: {e}")
+        if not saw:
+            # Server ignored stream=True: body is one JSON blob, not SSE.
+            return self.chat(messages, tools)
+
+        content = "".join(acc["content"])
+        usage = dict(acc["usage"] or {})
+        if not usage.get("prompt_tokens"):
+            usage["prompt_tokens"] = _estimate_tokens(json.dumps(messages, default=str))
+        if not usage.get("completion_tokens"):
+            usage["completion_tokens"] = _estimate_tokens(content)
+        stats = {
+            "prompt_tokens": usage.get("prompt_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens", 0),
+            "total_tokens": usage.get("total_tokens",
+                                      usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)),
+        }
+        calls = []
+        for tc in acc["tool_calls"]:
+            name = tc["function"].get("name", "")
+            if not tc.get("id") or not name:
+                continue
+            call_id = tc.get("id")
+            if not call_id:
+                call_id = self.tool_id
+                self.tool_id += 1
+            calls.append(ToolCall(
+                call_id=call_id, name=name,
+                args=_safe_json(tc["function"].get("arguments", "")),
+                output="", error="", provider_info={},
+            ))
+        message = {"role": "assistant", "content": content}
+        if calls:
+            message["content"] = content or None
+            message["tool_calls"] = [
+                {"id": c.call_id, "type": "function",
+                 "function": {"name": c.name, "arguments": json.dumps(c.args)}}
+                for c in calls
+            ]
+        return LLMResponse(
+            content=content, tool_calls=calls, message=message,
+            response_id="stream", stats=stats, output=[],
+        )
 
     def _error_response(self, message: str) -> LLMResponse:
         return LLMResponse(
@@ -781,10 +956,13 @@ class Wrapper:
         )
 
 
-if __name__ == "__main__":
-    print(logo)
+_LLM_MODEL = "3833d0220ac862d6de38448c0cd414bd2ca29d00"
+
+
+def _build_harness(event_bus=None):
+    """Construct the harness with tools + logging (shared by REPL and TUI)."""
     iso_time = dt.now().isoformat()
-    a = AgentHarness("3833d0220ac862d6de38448c0cd414bd2ca29d00", SYS_PROMPT)
+    a = AgentHarness(_LLM_MODEL, SYS_PROMPT, event_bus=event_bus)
     handlers = {
         "websearch": websearch,
         "read_file": read_file,
@@ -800,15 +978,53 @@ if __name__ == "__main__":
     }
     for tool in load_tools("tools.json", handlers):
         a.register_tool(tool)
-    logging.basicConfig(level=logging.INFO,handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],)
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],
+    )
+    return a
+
+
+def _run_repl(harness):
+    """Original plain-text REPL (default)."""
+    print(logo)
     while True:
-        pass
-        print("-"*50)
-        user_in = input("> ")
+        print("-" * 50)
+        try:
+            user_in = input("> ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
         logger.info(user_in)
         if user_in == '/stop' or user_in == '/s':
             break
-        response = a.run(user_in)
+        response = harness.run(user_in)
         print(response)
-        print("-"*50)
-        print(f"In {a.input} | Out {a.output}")
+        print("-" * 50)
+        print(f"In {harness.input} | Out {harness.output}")
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="pleiades",
+        description="PLEIADES agent harness — plain REPL or animated TUI.",
+    )
+    parser.add_argument("--tui", action="store_true",
+                        help="run the animated PLEIADES TUI instead of the plain REPL")
+    args = parser.parse_args()
+
+    if args.tui:
+        try:
+            from tui import run_tui
+        except ImportError:
+            print("The TUI needs 'rich'. Install it with:  pip install rich")
+            raise SystemExit(1)
+        try:
+            run_tui()
+        except KeyboardInterrupt:
+            print()
+        raise SystemExit(0)
+
+    _run_repl(_build_harness())

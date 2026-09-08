@@ -14,7 +14,7 @@ Tokenizer-accurate running count per conversation, plus an eviction policy (drop
 
 The small, always-on rule set that isn't task-specific — Socratic style, no-unsolicited-code, verbosity defaults. Implemented as a static system-prompt fragment, sitting beneath everything else. Built now, before skills/personas exist, so it's a stable baseline you can check later additions against ("did this skill/persona override a global trait").
 
-5. Skill registry (static)
+5. Skill registry (static) √
 
 Triggered procedures: instructions + example few-shots + which tools they use, selected by task relevance rather than invoked directly. Same registry pattern as tools (register/list/search-by-trigger/load-into-context). Skill metadata (name, description, trigger criteria) kept clean and machine-readable from the start, since persona and SOPs will both build on top of it.
 
@@ -46,6 +46,8 @@ Sits in front of the main loop and makes three kinds of decisions per request: w
 
 A monitor the router runs alongside execution, reading the same event stream. Detects tool-call loops, reasoning drift, context thrashing, error-retry loops, budget burn without progress, and task substitution — using cheap heuristics (repetition hashing, output-diffing, budget-vs-progress ratio) for most cases, and a periodic model-based goal-drift check for the subtler ones. Recovery escalates in tiers: nudge → interrupt-and-replan → rollback to last-good state → escalate to a stronger model → escalate to you. Built after the router because you need a stable notion of "the plan" to detect drift from, and the router's first version is what establishes that.
 
-13. UX: thinking animation + general animation
+13. UX: thinking animation + general animation √
 
 Fully decoupled presentation layer. The core loop emits state events (thinking, tool_call, tool_result, token, done) over whatever transport (SSE/WebSocket), and the frontend animates based on event type alone — it shouldn't need to know why the model is thinking. Parallelizable with everything above; build order doesn't matter here.
+
+Implementation: the harness emits `ux.Event`s into a thread-safe `EventBus` (`ux.py`, an `EventSink` abstraction so an SSE/WebSocket transport can replace it later). A rich-based PLEIADES TUI (`tui.py`) subscribes, runs each turn on a worker thread, and animates purely from event kind (streaming tokens included when the server supports SSE). Run it with `python main.py --tui`; the plain REPL stays the default (`python main.py`).
