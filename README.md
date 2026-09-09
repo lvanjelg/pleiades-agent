@@ -49,5 +49,3 @@ A monitor the router runs alongside execution, reading the same event stream. De
 13. UX: thinking animation + general animation √
 
 Fully decoupled presentation layer. The core loop emits state events (thinking, tool_call, tool_result, token, done) over whatever transport (SSE/WebSocket), and the frontend animates based on event type alone — it shouldn't need to know why the model is thinking. Parallelizable with everything above; build order doesn't matter here.
-
-Implementation: the harness emits `ux.Event`s into a thread-safe `EventBus` (`ux.py`, an `EventSink` abstraction so an SSE/WebSocket transport can replace it later). A rich-based PLEIADES TUI (`tui.py`) subscribes, runs each turn on a worker thread, and animates purely from event kind (streaming tokens included when the server supports SSE). Run it with `python main.py --tui`; the plain REPL stays the default (`python main.py`).

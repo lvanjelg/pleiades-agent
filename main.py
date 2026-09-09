@@ -646,14 +646,19 @@ class AgentHarness:
         for i in range(self.max_iterations):
             self._emit("thinking", iteration=i)
             streamed = {"tokens": 0}
+            streamed_reasoning = {"tokens": 0}
             if self.bus is not None:
                 def _on_token(text, _s=streamed):
                     _s["tokens"] += 1
                     self._emit("token", text=text)
+                def _on_reasoning(text, _s=streamed_reasoning):
+                    _s["tokens"] += 1
+                    self._emit("reasoning", text=text)
                 response = self.wrapper.chat_streamed(
                     messages=messages,
                     tools=self.tool_list() if self.tools else None,
                     on_token=_on_token,
+                    on_reasoning=_on_reasoning,
                 )
             else:
                 response = self.wrapper.chat(
@@ -663,6 +668,9 @@ class AgentHarness:
             reasoning = response.message.get("reasoning_content", "") if isinstance(response.message, dict) else ""
             logger.info("[reasoning]" + reasoning)
             logger.info("[response]" + response.content)
+            if self.bus is not None and reasoning and streamed_reasoning["tokens"] == 0:
+                # Non-stream fallback: surface reasoning that never streamed.
+                self._emit("reasoning", text=reasoning)
             self.state.record_message(
                 self.session_id, self.turn, "assistant", response.content or "",
                 tool_calls=response.message.get("tool_calls") if isinstance(response.message, dict) else None,
@@ -814,6 +822,19 @@ def _estimate_tokens(*texts: str) -> int:
     return total
 
 
+def _enable_thinking_param() -> dict:
+    """Request reasoning/thinking from mlx-serve via ``enable_thinking``.
+
+    Off by setting MLX_ENABLE_THINKING=0. The param only matters for reasoning-
+    capable models and is harmless to others, but a server that rejects unknown
+    params gets a retry without it (see chat_streamed).
+    """
+    value = os.getenv("MLX_ENABLE_THINKING", "1").lower().strip()
+    if value in ("0", "false", "no", "off"):
+        return {}
+    return {"enable_thinking": True}
+
+
 class Wrapper:
     def __init__(self, model):
         self.model = model
@@ -833,12 +854,19 @@ class Wrapper:
         return self.parse_response(r)
 
     def chat_streamed(self, messages: list[dict], tools: list[dict] = None,
-                      on_token=None, on_reasoning=None) -> LLMResponse:
-        """SSE streaming chat. Delivers content tokens to on_token as they arrive
-        and returns the SAME LLMResponse shape as chat(), so the harness loop is
-        unchanged. Falls back to chat() when the server doesn't actually stream
-        (non-SSE body), or when the request fails before any data arrives."""
-        payload = {"model": self.model, "messages": messages, "tools": tools, "stream": True}
+                      on_token=None, on_reasoning=None,
+                      _allow_thinking: bool = True) -> LLMResponse:
+        """SSE streaming chat. Delivers content tokens to on_token and reasoning
+        tokens (mlx-serve's ``reasoning_content``) to on_reasoning as they
+        arrive, and returns the SAME LLMResponse shape as chat(). Thinking is
+        requested via ``enable_thinking`` unless MLX_ENABLE_THINKING=0; if the
+        server rejects that param (HTTP 400) it retries once without it. Falls
+        back to chat() when the server doesn't actually stream (non-SSE body),
+        or when the request fails before any data arrives."""
+        payload = {"model": self.model, "messages": messages, "tools": tools,
+                   "stream": True}
+        if _allow_thinking:
+            payload.update(_enable_thinking_param())
         try:
             r = requests.post(
                 "http://192.168.1.92:8080/v1/chat/completions",
@@ -848,6 +876,9 @@ class Wrapper:
         except requests.exceptions.RequestException as e:
             return self._error_response(f"Request to LLM server failed: {e}")
         if r.status_code != 200:
+            if r.status_code == 400 and _allow_thinking and "enable_thinking" in payload:
+                return self.chat_streamed(messages, tools, on_token, on_reasoning,
+                                          _allow_thinking=False)
             return self.parse_response(r)
 
         acc = {"content": [], "reasoning": [], "tool_calls": [], "usage": {}, "finish": None}
@@ -869,6 +900,7 @@ class Wrapper:
             return self.chat(messages, tools)
 
         content = "".join(acc["content"])
+        reasoning = "".join(acc["reasoning"])
         usage = dict(acc["usage"] or {})
         if not usage.get("prompt_tokens"):
             usage["prompt_tokens"] = _estimate_tokens(json.dumps(messages, default=str))
@@ -895,6 +927,8 @@ class Wrapper:
                 output="", error="", provider_info={},
             ))
         message = {"role": "assistant", "content": content}
+        if reasoning:
+            message["reasoning_content"] = reasoning
         if calls:
             message["content"] = content or None
             message["tool_calls"] = [

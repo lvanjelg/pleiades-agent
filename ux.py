@@ -34,6 +34,7 @@ class EventKind(str, Enum):
     SYSTEM = "system"
     USER = "user"
     THINKING = "thinking"
+    REASONING = "reasoning"
     TOKEN = "token"
     MESSAGE = "message"
     TOOL_CALL = "tool_call"
