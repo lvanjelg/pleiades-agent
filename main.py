@@ -14,6 +14,7 @@ from typing import Callable, Any
 from dataclasses import dataclass, field
 import time
 import sqlite3
+import threading
 from datetime import datetime as dt, UTC
 from enum import Enum
 from graph_store import GraphStore
@@ -174,23 +175,20 @@ def websearch(query: str, search_depth: str = "basic", freshness: str | None = N
     return json.dumps(trimmed)
 
 
-def resolve_safe_path(relative_path: str, vault_root: str | None = None) -> Path:
+def resolve_safe_path(relative_path: str) -> Path:
     """Resolve a path under WORKING_ROOT and reject anything that escapes it.
-    If vault_root is provided and relative path is Obsidian-style (relative to vault),
-    resolve to {vault_root}/{relative_path} instead of working dir.
+
+    There is exactly one root: WORKING_ROOT. The vault (``pleiades-vault/``) is
+    an ordinary directory inside it, so vault paths are written repo-relative --
+    ``pleiades-vault/kanban/<board>.md`` -- and need no special resolution.
+
+    resolve() also follows symlinks, so a link that points outside the root is
+    rejected.
     """
     # If it looks like an absolute path (starts with / or /), reject it
     if Path(relative_path).is_absolute():
         raise ValueError(f"Absolute paths not allowed: {relative_path}")
-    
-    if vault_root:
-        resolved = (Path(vault_root) / relative_path).resolve()
-        # Verify it's under the vault_root
-        expected_resolved = (Path(vault_root) / relative_path).resolve()
-        if resolved.is_relative_to(expected_resolved):
-            return resolved
-    
-    # Fall back to working directory resolution
+
     resolved = (WORKING_ROOT / relative_path).resolve()
     if not resolved.is_relative_to(WORKING_ROOT.resolve()):
         raise ValueError(f"Path escapes working directory: {relative_path}")
@@ -269,19 +267,74 @@ def fetch_url(url: str, max_length: int | None = None) -> str:
     return _cap(text, max_length or 4000)
 
 
+def _git_invocations(command: str) -> list[tuple[str, str]]:
+    """Every ``git <sub> <rest>`` the command string appears to contain.
+
+    Skips git's global options (``-C path``, ``-c key=val``, ``--git-dir=…``) so
+    that ``git -C /tmp clean -fd`` is seen as ``clean``.
+    """
+    found = []
+    for match in re.finditer(r"(?<![\w-])git\b([^|;&\n]*)", command):
+        words = match.group(1).split()
+        i = 0
+        while i < len(words):
+            word = words[i]
+            if word in ("-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                        "--exec-path"):
+                i += 2
+            elif word.startswith("-"):
+                i += 1
+            else:
+                break
+        if i < len(words):
+            found.append((words[i], " ".join(words[i + 1:])))
+    return found
+
+
+# Subcommands that destroy work, with the flag forms that make them destructive.
+# `checkout` is refused outright: it silently discards worktree changes when
+# given a path, and `git switch` / `git branch` cover the branch cases without
+# being able to touch files. `reset` without --hard/--merge/--keep only unstages,
+# so it stays available.
+_DESTRUCTIVE_GIT: dict[str, Callable[[str], bool]] = {
+    "clean": lambda rest: True,
+    "restore": lambda rest: True,
+    "checkout": lambda rest: True,
+    "reset": lambda rest: any(f in rest for f in ("--hard", "--merge", "--keep")),
+    "stash": lambda rest: re.match(r"\s*(drop|clear)\b", rest) is not None,
+}
+
+
+def refuse_destructive_git(command: str) -> None:
+    """Raise if the command string contains a destructive git subcommand.
+
+    A denylist over a shell string is a speed bump, not a sandbox: quoting tricks,
+    ``sudo``, a wrapper script, or ``sh -c`` all get past it. Its job is to stop
+    the accident -- a reflexive ``git clean -xdf`` typed into a shell tool -- not
+    a determined bypass. Real protection is that `git clean` never removes tracked
+    files, and that anything untracked or ignored has a backup.
+    """
+    for sub, rest in _git_invocations(command):
+        check = _DESTRUCTIVE_GIT.get(sub)
+        if check and check(rest):
+            raise ValueError(
+                f"Refused: `git {sub}` is destructive and the harness will not run "
+                f"it. Ask the user to run it in their own terminal instead. "
+                f"(For branch moves use `git switch`; to unstage use `git reset` "
+                f"without --hard; to inspect changes use `git diff`.)")
+
+
 def run_shell(command: str, cwd: str | None = None) -> str:
     args = shlex.split(command)
     if not args:
         raise ValueError("Empty command")
+    refuse_destructive_git(command)
     # Working directory. A caller-supplied cwd goes through the path guard, which
     # rejects absolute paths. The fallbacks are already-rooted, trusted paths, so
     # they must NOT go through resolve_safe_path — it would reject them for being
     # absolute, and every default call would fail.
-    vault_env = os.environ.get("VAULT_ROOT", "").strip()
     if cwd:
         work_dir = resolve_safe_path(cwd)
-    elif vault_env:
-        work_dir = Path(vault_env).resolve()
     else:
         work_dir = WORKING_ROOT
 
@@ -305,6 +358,7 @@ def run_bash(command: str, cwd: str | None = None) -> str:
     that needs actual shell features or falls outside run_shell's allow list."""
     if not command or not command.strip():
         raise ValueError("Empty command")
+    refuse_destructive_git(command)
     work_dir = resolve_safe_path(cwd) if cwd else WORKING_ROOT
     proc = subprocess.run(command, shell=True, cwd=work_dir,
                           capture_output=True, text=True, timeout=120)
@@ -323,8 +377,8 @@ def _format_matches(matches: list[tuple[str, int, str]], truncated: bool = False
     return "\n".join(lines) if lines else "(no matches)"
 
 
-def search_files(pattern: str, path: str | None = None, file_glob: str | None = None, vault_root: str | None = None) -> str:
-    root = resolve_safe_path(path, vault_root) if path else resolve_safe_path(".", vault_root)
+def search_files(pattern: str, path: str | None = None, file_glob: str | None = None) -> str:
+    root = resolve_safe_path(path) if path else resolve_safe_path(".")
     if not root.is_dir():
         raise ValueError(f"Not a directory: {path or WORKING_ROOT}")
     try:
@@ -342,11 +396,7 @@ def search_files(pattern: str, path: str | None = None, file_glob: str | None = 
                 for lineno, line in enumerate(f, 1):
                     hit = compiled.search(line) if use_regex else pattern in line
                     if hit:
-                        # Path should be relative to vault_root for Obsidian-style paths
-                        if vault_root:
-                            rel = p.relative_to(Path(vault_root))
-                        else:
-                            rel = p.relative_to(WORKING_ROOT)
+                        rel = p.relative_to(WORKING_ROOT)
                         matches.append((str(rel), lineno, line.rstrip()))
                         if len(matches) >= MAX_SEARCH_MATCHES:
                             return _format_matches(matches, truncated=True)
@@ -355,20 +405,37 @@ def search_files(pattern: str, path: str | None = None, file_glob: str | None = 
     return _format_matches(matches)
 
 
-def memory_note(mode: str, key: str | None = None, content: str | None = None, vault_root: str | None = None) -> str:
-    # Notes default to <working root>/memory. A caller-supplied vault_root still
-    # goes through the path guard like every other path.
-    notes_dir = resolve_safe_path("memory", vault_root) if vault_root else (WORKING_ROOT / "memory")
+def _note_path(key: str) -> Path:
+    """Resolve a memory note path, confined to ``<root>/memory``.
+
+    Two checks, two questions. The path guard answers *does this write leave the
+    repo?* -- without it, ``key="../../x"`` wrote a file outside the root. The
+    containment test then answers *is this a note at all?* -- ``key="../outside"``
+    stays inside the repo but would land beside the code, not in the notes
+    directory.
+    """
+    notes_dir = (WORKING_ROOT / "memory").resolve()
+    path = resolve_safe_path(f"memory/{key}.md")
+    if not path.is_relative_to(notes_dir):
+        raise ValueError(f"Note key must stay inside memory/: {key!r}")
+    return path
+
+
+def memory_note(mode: str, key: str | None = None, content: str | None = None) -> str:
+    # Notes live at <working root>/memory -- agent state, kept out of the vault.
+    # `key` is model-supplied, so it is never interpolated into a path raw.
+    notes_dir = WORKING_ROOT / "memory"
     if mode == "save":
         if not key or content is None:
             raise ValueError("save requires both 'key' and 'content'")
-        notes_dir.mkdir(parents=True, exist_ok=True)
-        (notes_dir / f"{key}.md").write_text(content, encoding="utf-8")
-        return f"Saved note '{key}' to {notes_dir / f'{key}.md'}"
+        note_path = _note_path(key)
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text(content, encoding="utf-8")
+        return f"Saved note '{key}' to {note_path}"
     if mode == "recall":
         if not key:
             raise ValueError("recall requires 'key'")
-        note_path = notes_dir / f"{key}.md"
+        note_path = _note_path(key)
         if not note_path.exists():
             raise FileNotFoundError(f"No note found for key '{key}'")
         return note_path.read_text(encoding="utf-8")
@@ -481,8 +548,7 @@ SKILLS = load_skills()
 Creates agent DB with SQLite to track sessions and tool invocations and provide analytics
 '''
 class AgentState:
-    def __init__(self, db_path: str = "agent_state.db", vault_root: str | None = None):
-        self.vault_root = vault_root
+    def __init__(self, db_path: str = "agent_state.db"):
         # The TUI runs harness.run() on a worker thread while AgentState is created
         # on the main thread. Only one turn runs at a time, so relaxing the
         # same-thread check is safe here.
@@ -593,14 +659,15 @@ class AgentHarness:
         self.state = AgentState()
         self.session_id = str(uuid.uuid4())
         self.user_id = "local"
-        self.state.create_session(self.session_id, self.user_id)
         # Graph store (README step 7): persistent nodes/edges across sessions.
         self.graph = GraphStore(GRAPH_DB_PATH)
-        self.conversation_node = self.graph.upsert_node(
-            "conversation", self.session_id,
-            label=f"session {self.session_id[:8]}",
-            properties={"user_id": self.user_id, "model": self.model,
-                        "provider": self.provider.name})
+        # The session's DB row and its conversation node are written by
+        # _ensure_session() on the first turn, not here. A process that starts and
+        # exits without taking a turn is not a session; writing the row at
+        # construction time made kind="sessions" list empty runs as if they were
+        # prior work, which is what buried the real history.
+        self.conversation_node = None
+        self._session_started = False
         for skill in load_skill_meta():
             self.graph.upsert_node("skill", skill["name"], label=skill["name"],
                                    properties={"description": skill["description"]})
@@ -613,6 +680,24 @@ class AgentHarness:
         self.budgeter = BudgetEnforcer(self.context)
         self.messages: list[dict] = []
         self.keep_msg_count = 8
+        self._cancel = threading.Event()
+        """Set by cancel(); the run loop checks it between iterations and tool
+        calls. Threads cannot be killed, so cancellation is cooperative — the
+        wait is bounded by one LLM request (read timeout) or one tool run."""
+
+    # -- cancellation ----------------------------------------------------
+    def cancel(self) -> None:
+        """Ask the running turn to stop at the next check point."""
+        self._cancel.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def _new_turn(self) -> None:
+        """Reset per-turn state (cancel flag, turn timer) before iterating."""
+        self._cancel.clear()
+        self.budgeter.start_time = time.time()
 
     # -- decoupled UX events (README step 13) ---------------------------
     def _emit(self, kind: str, **data) -> None:
@@ -632,6 +717,24 @@ class AgentHarness:
             pass
 
     # -- graph store (README step 7) ------------------------------------
+    def _ensure_session(self) -> None:
+        """Materialise this session's row + conversation node, once, on turn 1.
+
+        Idempotent via the flag (and necessarily so: ``sessions.session_id`` is a
+        PRIMARY KEY, so a second insert would raise IntegrityError). Must run
+        before any ``_record_*_graph`` call, which attach edges to
+        ``self.conversation_node``.
+        """
+        if self._session_started:
+            return
+        self._session_started = True
+        self.state.create_session(self.session_id, self.user_id)
+        self.conversation_node = self.graph.upsert_node(
+            "conversation", self.session_id,
+            label=f"session {self.session_id[:8]}",
+            properties={"user_id": self.user_id, "model": self.model,
+                        "provider": self.provider.name})
+
     def _record_turn_graph(self, user_input: str):
         """Create the turn's task + user-message nodes, created_in this conversation."""
         try:
@@ -695,6 +798,11 @@ class AgentHarness:
 
     def _sync_conversation_node(self) -> None:
         """Keep the graph's conversation node describing the current backend."""
+        if not self._session_started:
+            # No turn yet -> no conversation node to describe. Upserting here
+            # would re-create exactly the empty session rows we just stopped
+            # writing, via /model and /provider switching.
+            return
         try:
             self.graph.upsert_node(
                 "conversation", self.session_id,
@@ -774,11 +882,9 @@ class AgentHarness:
             return [merged] + recent
         return [{"role": "system", "content": summary_text}] + recent
 
-    def run(self, user_input: str, root_dir: str | None = None) -> str:
-        # Use root_dir if provided, otherwise fallback to vault_root from AgentState
-        effective_vault_root = root_dir or getattr(self.state, "vault_root", "pleiades")
-        self.vault_root = effective_vault_root
-        
+    def run(self, user_input: str) -> str:
+        self._ensure_session()
+        self._new_turn()
         self.turn += 1
         self._emit("user", content=user_input)
         messages = [
@@ -801,6 +907,16 @@ class AgentHarness:
         self.state.record_message(self.session_id, self.turn, "user", user_input)
         task_node = self._record_turn_graph(user_input)
         for i in range(self.max_iterations):
+            # Cooperative stop points: before each LLM call, and after each
+            # tool call below. Budget (time/tool calls) was previously dead
+            # code — check() existed but nothing called it, so a turn could
+            # loop 100 times or sit on a wedged connection with no exit.
+            stop = self._cancel.is_set()
+            if not stop:
+                stop = self.budgeter.check()
+            if stop:
+                self._emit("done", content=f"Stopped: {stop}")
+                return f"Stopped: {stop}"
             self._emit("thinking", iteration=i)
             streamed = {"tokens": 0}
             streamed_reasoning = {"tokens": 0}
@@ -844,6 +960,11 @@ class AgentHarness:
             if not response.tool_calls:
                 self._emit("done", content=response.content or "")
                 return response.content
+            if self._cancel.is_set():
+                # The model may have streamed tool calls before the flag was
+                # set; don't execute them on a cancelled turn.
+                self._emit("done", content="Stopped: cancelled by user")
+                return "Stopped: cancelled by user"
             if not self.provider.reasoning_replay and isinstance(response.message, dict):
                 response.message.pop("reasoning_content", None)
             messages.append(response.message)
@@ -873,8 +994,24 @@ class AgentHarness:
                            success=success, duration_ms=duration_ms,
                            preview=str(result)[:600] if result else "")
                 messages.append({"role": "tool", "content": str(result), "tool_call_id": call.call_id})
+                # Between tool calls: this is where a long tool trace used to
+                # run on with no way out. Record usage for the budget check.
+                self.budgeter.record_tool_call(call.name)
+                if self._cancel.is_set() or self.budgeter.check():
+                    self._emit("done", content="Stopped: cancelled by user"
+                               if self._cancel.is_set() else "Stopped: budget exceeded")
+                    return "Stopped"
         self._emit("done", content="Max iterations reached.")
         return "Max iterations reached."
+
+    def set_thinking(self, level: str) -> str:
+        """Set the thinking level: an effort word (for reasoning_effort
+        providers) or on/off (for enable_thinking providers).
+
+        Returns a status line; raises ValueError on an unknown level. Applied
+        to the live provider, so the next request uses it immediately.
+        """
+        return self.provider.set_thinking(level)
 
     def run_subagent(self, agent: str, task: str, _from: str | None = None, _depth: int = 0) -> str:
         if agent not in SUBAGENTS:
@@ -1252,7 +1389,9 @@ if __name__ == "__main__":
         description="PLEIADES agent harness — plain REPL or animated TUI.",
     )
     parser.add_argument("--tui", action="store_true",
-                        help="run the animated PLEIADES TUI instead of the plain REPL")
+                        help="run the PLEIADES TUI instead of the plain REPL")
+    parser.add_argument("--rich", action="store_true",
+                        help="with --tui, run the legacy rich frontend instead of Textual")
     parser.add_argument("--provider", choices=list(providers.PROVIDER_NAMES), default=None,
                         help="LLM backend: 'local' (mlx-serve on the LAN) or 'deepseek' "
                              "(api.deepseek.com). Defaults to $PLEIADES_PROVIDER, else 'local'.")
@@ -1263,13 +1402,25 @@ if __name__ == "__main__":
 
     try:
         if args.tui:
+            if args.rich:
+                try:
+                    from tui import run_tui
+                except ImportError:
+                    print("The legacy TUI needs 'rich'. Install it with:  pip install rich")
+                    raise SystemExit(1)
+                try:
+                    run_tui(provider=args.provider, model=args.model)
+                except KeyboardInterrupt:
+                    print()
+                raise SystemExit(0)
             try:
-                from tui import run_tui
+                from textual_tui import run_textual_tui
             except ImportError:
-                print("The TUI needs 'rich'. Install it with:  pip install rich")
+                print("The TUI needs 'textual'. Install it with:  "
+                      "pip install -r requirements.txt")
                 raise SystemExit(1)
             try:
-                run_tui(provider=args.provider, model=args.model)
+                run_textual_tui(provider=args.provider, model=args.model)
             except KeyboardInterrupt:
                 print()
             raise SystemExit(0)

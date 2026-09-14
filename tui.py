@@ -79,104 +79,17 @@ from rich.text import Text
 from rich.theme import Theme
 
 from ux import Event, EventBus, EventKind
+# Shared presentation layer (palette, token and tool-row formatting) so the
+# Textual frontend and this legacy one cannot drift apart.
+from presentation import (ARGS_MAX, PI, PREVIEW_MAX, THINKING_STYLE,  # noqa: F401
+                          TOOL_ROWS_MAX, args_summary as _args_summary,
+                          format_tokens, preview as _preview,
+                          rich_theme as get_theme, thinking_label)
 
-PREVIEW_MAX = 88    # tool result preview — with its 4-space indent this still
-                    # fits one line on a 100-column terminal
-ARGS_MAX = 80       # tool call args summary
-TOOL_ROWS_MAX = 8   # tool blocks shown before collapsing into "… +N earlier"
 # The live loop can redraw ~50x/sec while tokens stream. Parsing markdown costs
 # ~3x a plain text render (measured), so the live preview re-parses at most this
 # often (plus a term that grows with the reply) instead of on every frame.
 LIVE_MARKDOWN_INTERVAL = 0.15
-
-# pi's dark theme palette, verbatim from
-# packages/coding-agent/src/modes/interactive/theme/dark.json
-PI = {
-    "text": "#d4d4d4",
-    "muted": "#808080",
-    "dim": "#666666",
-    "accent": "#8abeb7",
-    "success": "#b5bd68",
-    "error": "#cc6666",
-    "warning": "#ffff00",
-    "borderMuted": "#505050",
-    "userMessageBg": "#343541",
-    "toolPendingBg": "#282832",
-    "toolSuccessBg": "#283228",
-    "toolErrorBg": "#3c2828",
-    "thinkingText": "#808080",
-    "toolOutput": "#808080",
-    "mdHeading": "#f0c674",
-    "mdCode": "#8abeb7",
-    "mdCodeBlock": "#b5bd68",
-    "mdLink": "#81a2be",
-}
-
-
-def get_theme() -> Theme:
-    """Rich theme mirroring pi's markdown colours, so rendered markdown
-    matches what pi would draw (headings, code, quotes, bullets)."""
-    return Theme({
-        "markdown.h1": f"bold {PI['mdHeading']}",
-        "markdown.h2": f"bold {PI['mdHeading']}",
-        "markdown.h3": f"bold {PI['mdHeading']}",
-        "markdown.h4": PI["mdHeading"],
-        "markdown.h5": PI["mdHeading"],
-        "markdown.h6": PI["mdHeading"],
-        "markdown.code": PI["mdCode"],
-        "markdown.code_block": PI["mdCodeBlock"],
-        "markdown.block_quote": PI["muted"],
-        "markdown.item.bullet": PI["accent"],
-        "markdown.item.number": PI["accent"],
-        "markdown.link": PI["mdLink"],
-        "markdown.link_url": PI["dim"],
-        "markdown.hr": PI["muted"],
-        "markdown.strong": f"bold {PI['text']}",
-        "markdown.em": f"italic {PI['text']}",
-        "markdown.table.header": f"bold {PI['text']}",
-        "markdown.table.border": PI["borderMuted"],
-    })
-
-
-def thinking_label(provider) -> str:
-    """The active thinking level, as pi shows it next to the model name."""
-    try:
-        params = provider.thinking_params()
-    except Exception:
-        return ""
-    if "reasoning_effort" in params:
-        return str(params["reasoning_effort"])
-    return "on" if params.get("enable_thinking") else "off"
-
-
-def format_tokens(count: int) -> str:
-    """Compact token counts for the footer (pi prints 1.0k / 13.9k / 1.2M)."""
-    count = int(count or 0)
-    if count < 1000:
-        return str(count)
-    if count < 10_000:
-        return f"{count / 1000:.1f}k"
-    if count < 1_000_000:
-        return f"{round(count / 1000)}k"
-    if count < 10_000_000:
-        return f"{count / 1_000_000:.1f}M"
-    return f"{round(count / 1_000_000)}M"
-
-
-def _preview(text: str, limit: int = PREVIEW_MAX) -> str:
-    text = (text or "").replace("\n", " ").strip()
-    if not text:
-        return ""
-    return text if len(text) <= limit else text[: limit - 1] + "…"
-
-
-def _args_summary(args) -> str:
-    if args is None:
-        return ""
-    try:
-        return _preview(json.dumps(args, ensure_ascii=False), ARGS_MAX)
-    except Exception:
-        return str(args)[:ARGS_MAX]
 
 
 def _is_blank(line) -> bool:
@@ -488,7 +401,7 @@ class Tui:
 
     def _thinking_renderable(self, markdown: bool, throttle: bool):
         """Thinking, as pi draws it: italic in the ``thinkingText`` grey, no box."""
-        style = f"italic {PI['thinkingText']}"
+        style = THINKING_STYLE
         if throttle:
             return self._throttled_markdown(self._reasoning, "thinking", style)
         try:

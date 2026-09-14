@@ -111,3 +111,64 @@ Two backend behaviours the wrapper has to respect, both encoded on the provider:
 Switching to `deepseek` also removes the LAN server dependency at startup: the
 local provider probes `GET /v1/models` for its context window, while hosted
 providers use a known value, so no local server needs to be running.
+
+## TUI
+
+`python main.py --tui` runs a full-screen [Textual](https://textual.textualize.io)
+app — the frontend the harness was designed around. Both frontends are built on
+the same three pieces, so they can't drift apart visually:
+
+| module | role |
+|--------|------|
+| `ux.py` | `EventSink` / `EventBus`: the loop emits state events and never renders |
+| `presentation.py` | the pi palette, tool-state glyphs/tints, token formatting, preview trimming |
+| `textual_tui/` | Textual frontend: `model.py` (transcript, no UI imports), `events.py` (sink → messages), `widgets.py`, `app.py` |
+| `tui.py` | the legacy hand-rolled rich frontend, kept behind `--rich` |
+
+```bash
+python main.py --tui                    # Textual
+python main.py --tui --rich             # legacy rich frontend
+python main.py --tui --provider deepseek
+```
+
+Keys: `enter` send · `/help` commands · `ctrl+p` command palette · `pageup` /
+`pagedown` scroll · `ctrl+home` jump to the newest output · `ctrl+l` clear ·
+`ctrl+q` quit. The mouse wheel scrolls the transcript wherever the pointer is —
+over the reply, the prompt or the status row.
+
+The transcript follows the tail while a turn streams. Scrolling up releases it
+immediately, even by a single notch, and the view then stays where you put it for
+the rest of the turn; returning to the bottom (or `ctrl+home`) resumes following.
+
+Text is selectable and copyable; a streaming reply is appended to the rendered
+document rather than re-rendered.
+
+Slash commands work in both frontends and are also in the palette. `/provider`
+and `/model` with no argument open a picker rather than printing a list.
+
+Layout is deliberate: a turn reads top to bottom in event order — prompt,
+thinking, one collapsible per tool call (collapsed once finished, click to
+expand its output), then the reply — so the newest output is where your eye
+already is.
+
+> One workaround is carried: `guard_detached_hit_test()` in `textual_tui/app.py`.
+> Textual's selection code assumes the widget its mouse hit test returns still has
+> a parent, but the hit-test map is only rebuilt on refresh — so clicking a
+> markdown block that had just been rewritten (i.e. clicking a streaming answer)
+> could kill the app with `AttributeError: 'NoneType' object has no attribute
+> 'region'`. The shim turns such a click into a no-op. Delete it if Textual ever
+> guards the `None` itself; the reproduction in `tests/test_textual_tui.py` will
+> tell you whether the bug is still there.
+
+### Tests
+
+```bash
+.venv/bin/python tests/test_textual_tui.py
+```
+
+Headless — `App.run_test()` renders into an in-memory terminal, and the harness is
+faked — so it runs in CI with no tty and no network. It covers the transcript
+model, the event sink, the whole app (turn rendering, order and visible height of
+every band, status line, resize, commands, palette, error path), follow-the-tail,
+and one construction pass against the real harness to catch frontend/harness API
+drift.

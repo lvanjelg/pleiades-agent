@@ -2,7 +2,9 @@
 AGENTS.md
 logs/
 agent_state.db
+agent_state.db.*
 prompt.md
 __pycache__
 pleiades-vault/
+memory/
 .DS_Store

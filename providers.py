@@ -131,8 +131,54 @@ class Provider:
             return {"thinking": {"type": "enabled"}, "reasoning_effort": effort}
         return {}
 
+    def thinking_label(self, provider=None) -> str:
+        """The active thinking level, mirroring presentation.thinking_label,
+        with ``reasoning_effort: none`` normalised to ``off``."""
+        try:
+            params = self.thinking_params()
+        except Exception:
+            return ""
+        if "reasoning_effort" in params:
+            effort = str(params["reasoning_effort"])
+            return "off" if effort in ("none", "off") else effort
+        return "on" if params.get("enable_thinking") else "off"
+
     def stream_usage_param(self) -> dict:
         return {"stream_options": {"include_usage": True}} if self.stream_usage else {}
+
+    # ---- thinking control ----------------------------------------------
+    def thinking_levels(self) -> list[str]:
+        """Levels this backend accepts, for /thinking suggestions."""
+        if self.thinking_style == "enable_thinking":
+            return ["on", "off"]
+        if self.thinking_style == "reasoning_effort":
+            return ["off", "low", "medium", "high"]
+        return []
+
+    def set_thinking(self, level: str) -> str:
+        """Set the thinking level for subsequent requests.
+
+        ``Provider`` is frozen (shared, registered globally), so the setting
+        lives in an env var — the same channel ``thinking_params`` already
+        reads, which also makes it visible to a restarted process.
+
+        Returns the new level as reported by :meth:`thinking_label`; raises
+        ValueError on a level this dialect does not accept.
+        """
+        level = (level or "").strip().lower()
+        if self.thinking_style == "enable_thinking":
+            if level not in ("on", "off"):
+                raise ValueError("level must be on|off for this provider")
+            os.environ["MLX_ENABLE_THINKING"] = "1" if level == "on" else "0"
+        elif self.thinking_style == "reasoning_effort":
+            if level not in ("off", "none", "low", "medium", "high"):
+                raise ValueError("level must be off|low|medium|high for this provider")
+            if level == "none":
+                level = "off"
+            os.environ["DEEPSEEK_REASONING_EFFORT"] = level
+        else:
+            raise ValueError("this provider has no thinking control")
+        return self.thinking_label(self)
 
 
 PROVIDERS: dict[str, Provider] = {

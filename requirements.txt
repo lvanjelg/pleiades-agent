@@ -1,0 +1,16 @@
+# PLEIADES runtime dependencies.
+#
+# Install into the project venv with the interpreter, not the pip shim:
+#   .venv/bin/python -m pip install -r requirements.txt
+# (.venv/bin/pip carries a stale shebang pointing at a different checkout.)
+#
+# Agent loop + providers
+requests==2.34.2
+python-dotenv==1.2.2
+
+# Frontends
+textual==8.2.8          # Textual TUI (python main.py --tui)
+rich==15.0.0            # legacy TUI (python main.py --tui --rich) + Textual's renderables
+
+# Developer tooling (optional): `textual run --dev`, `textual console`, `textual serve`
+textual-dev==1.8.0
