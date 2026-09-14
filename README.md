@@ -18,13 +18,21 @@ The small, always-on rule set that isn't task-specific — Socratic style, no-un
 
 Triggered procedures: instructions + example few-shots + which tools they use, selected by task relevance rather than invoked directly. Same registry pattern as tools (register/list/search-by-trigger/load-into-context). Skill metadata (name, description, trigger criteria) kept clean and machine-readable from the start, since persona and SOPs will both build on top of it.
 
-6. Persona layer (static, manually selected)
+6. Persona layer (static, manually selected) √
 
 Standing identity — career coach, project architect, coding agent — implemented as a system-prompt fragment plus policy knobs (preferred/excluded skills, verbosity, code-vs-no-code) layered on top of global traits. Manually selected at first (e.g. a /persona command). Comes after skills because its job is partly to narrow/modulate skill selection and delivery, which can't be tested without skills existing.
 
-7. Graph store
+7. Graph store √
 
 Nodes for messages, tools, skills, SOPs, conversations, tasks; edges for composed_of, created_in, used_in, succeeded/failed, references. This is where relationship-queries live that SQL can't answer well: skill/tool lineage, persona-scoped memory, which self-created artifacts never got promoted. Built once there's enough SQL history to mine — mining relationships from an empty store isn't useful.
+
+Implemented in `graph_store.py` — tables `graph_nodes` / `graph_edges` in `agent_state.db`, sharing the harness's SQLite file so cross-session history accumulates in one place. Node types: `conversation, task, message, tool, skill, sop, artifact`. Edge types: `created_in, used_in, succeeded, failed, composed_of, references`.
+
+Edges aggregate instead of duplicating: one edge per `(src, dst, relation)` whose `properties` carry running `count` / `last_ms`, so N tool calls are one edge with a total, not N rows. `tool_stats()` then answers "which tools do I actually use, how often, and with what success rate" directly off the graph, and `tools_used_together()` finds co-occurrence across sessions.
+
+The harness records a `conversation` node at startup, a `task` + user/assistant `message` nodes per turn (`created_in`), and per tool call a `used_in` plus a `succeeded`/`failed` edge. `GraphStore.digest()` is injected each turn as a `CROSS-SESSION MEMORY (graph store)` system message, so what was learned in a previous session is present in the next one.
+
+Query it via the `graph_query` tool (`summary`, `tools`, `skills`, `sessions`, `tasks`, `lineage`, `cooccurrence`, `search`) or the `/graph` command in both the REPL and the TUI.
 
 8. Creation pipeline v1: tools
 
@@ -49,3 +57,57 @@ A monitor the router runs alongside execution, reading the same event stream. De
 13. UX: thinking animation + general animation √
 
 Fully decoupled presentation layer. The core loop emits state events (thinking, tool_call, tool_result, token, done) over whatever transport (SSE/WebSocket), and the frontend animates based on event type alone — it shouldn't need to know why the model is thinking. Parallelizable with everything above; build order doesn't matter here.
+
+## Providers
+
+The model backend is pluggable (`providers.py`). Each provider owns its endpoint,
+auth env var, and thinking-mode dialect, so the harness loop stays provider-blind.
+
+| Provider | Endpoint | Key env | Default model | Thinking |
+|----------|----------|---------|---------------|----------|
+| `local` (default) | `http://192.168.1.92:8080/v1` | `API_KEY` | mlx-serve hash id | `enable_thinking` |
+| `deepseek` | `https://api.deepseek.com` | `DEEPSEEK_API` | `deepseek-flash` | `thinking` + `reasoning_effort` |
+
+```bash
+python main.py                          # local mlx-serve (default)
+python main.py --provider deepseek      # DeepSeek API
+python main.py --tui --provider deepseek
+```
+
+Selection order: `--provider` flag → `PLEIADES_PROVIDER` → `local`. `--model`
+overrides, as do `LLM_MODEL` (local) and `DEEPSEEK_MODEL` / `DEEPSEEK_BASE_URL`
+(hosted). `DEEPSEEK_REASONING_EFFORT` sets `low` / `high` / `max` (`none`
+disables thinking); `MLX_ENABLE_THINKING=0` does the same for mlx-serve.
+
+### Switching while running
+
+Both the REPL and the TUI take `/provider` and `/model` at the prompt, alongside
+`/stop`:
+
+```
+/provider                show the active backend + what's available
+/provider deepseek       switch backend (endpoint, auth, thinking dialect)
+/model                   show the active model + what the provider advertises
+/model deepseek-v4-pro   switch model within the current backend
+```
+
+Switching is in place: the tool registry, session id, message history, budget
+counters and graph all survive, and the very next turn uses the new backend's
+dialect. The graph's `conversation` node is re-stamped with the new
+provider/model, so `/graph` reflects what actually ran. `--provider`/`--model`
+set the starting point; these commands change it afterwards.
+
+Two backend behaviours the wrapper has to respect, both encoded on the provider:
+
+- **Reasoning replay.** When a request carries `tools`, DeepSeek requires every
+  earlier turn's `reasoning_content` to be echoed back or it returns HTTP 400.
+  Assistant reasoning is therefore persisted in `messages.reasoning` and replayed
+  for providers with `reasoning_replay`. mlx-serve doesn't want it, so there it is
+  dropped rather than burning context.
+- **Streamed usage.** DeepSeek only reports token usage mid-stream when
+  `stream_options.include_usage` is set (`stream_usage`); mlx-serve is asked
+  without it. Both fall back to a char/4 estimate if usage is absent.
+
+Switching to `deepseek` also removes the LAN server dependency at startup: the
+local provider probes `GET /v1/models` for its context window, while hosted
+providers use a known value, so no local server needs to be running.

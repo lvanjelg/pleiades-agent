@@ -16,6 +16,8 @@ import time
 import sqlite3
 from datetime import datetime as dt, UTC
 from enum import Enum
+from graph_store import GraphStore
+import providers
 load_dotenv() 
 logger = logging.getLogger(__name__)
 LOG_DIR = "logs/"
@@ -28,6 +30,7 @@ ALLOWED_SHELL_COMMANDS = {"git", "pytest", "pip", "python", "python3",
 SKILLS_DIR = "skills/"
 SUBAGENT_MAX_DEPTH = 3
 AGENTS_DIR = "agents/"
+GRAPH_DB_PATH = "agent_state.db"  # graph store shares the harness SQLite file
 with open("prompt.md", encoding="utf-8") as _prompt_file:
     SYS_PROMPT = _prompt_file.read().replace(
         "{current_date}", dt.now().date().isoformat())
@@ -270,26 +273,22 @@ def run_shell(command: str, cwd: str | None = None) -> str:
     args = shlex.split(command)
     if not args:
         raise ValueError("Empty command")
-    # Determine effective working directory
+    # Working directory. A caller-supplied cwd goes through the path guard, which
+    # rejects absolute paths. The fallbacks are already-rooted, trusted paths, so
+    # they must NOT go through resolve_safe_path — it would reject them for being
+    # absolute, and every default call would fail.
+    vault_env = os.environ.get("VAULT_ROOT", "").strip()
     if cwd:
-        if "vault_root" in command or "root_dir" in command:
-            effective_cwd = cwd.split("vault_root")[-1].split("root_dir")[-1].strip()
-            effective_cwd = effective_cwd or cwd.split("vault_root=")[1].split("root_dir=")[-1]
-        else:
-            effective_cwd = cwd
-    elif "vault_root" in os.environ.get("VAULT_ROOT", "").strip():
-        effective_cwd = os.environ["VAULT_ROOT"].strip()
+        work_dir = resolve_safe_path(cwd)
+    elif vault_env:
+        work_dir = Path(vault_env).resolve()
     else:
-        effective_cwd = WORKING_ROOT
-    
-    # Override work_dir with the effective directory
-    resolved_cwd = resolve_safe_path(effective_cwd)
-    work_dir = resolved_cwd if cwd else resolved_cwd
-    
+        work_dir = WORKING_ROOT
+
     if args[0] not in ALLOWED_SHELL_COMMANDS:
-        answer = input(f"Run command? (y/n): {command}\n> ")
-        if answer.strip().lower() != "y":
-            return "Permission denied by user."
+        return (f"Denied: '{args[0]}' is not in the allow list "
+                f"({', '.join(sorted(ALLOWED_SHELL_COMMANDS))}). "
+                f"Use 'bash' if you genuinely need it — that tool has no allow list.")
     proc = subprocess.run(args, cwd=work_dir, capture_output=True, text=True, timeout=60)
     out = proc.stdout or ""
     if proc.stderr:
@@ -357,8 +356,8 @@ def search_files(pattern: str, path: str | None = None, file_glob: str | None = 
 
 
 def memory_note(mode: str, key: str | None = None, content: str | None = None, vault_root: str | None = None) -> str:
-    if vault_root is None:
-        vault_root = getattr(getattr(__import__("main"), "main"), "AgentState" if False else None)
+    # Notes default to <working root>/memory. A caller-supplied vault_root still
+    # goes through the path guard like every other path.
     notes_dir = resolve_safe_path("memory", vault_root) if vault_root else (WORKING_ROOT / "memory")
     if mode == "save":
         if not key or content is None:
@@ -444,11 +443,12 @@ def load_subagents(agents_dir: str = AGENTS_DIR) -> dict:
 SUBAGENTS = load_subagents()
 
 
-def load_skills(skills_dir: str = SKILLS_DIR) -> str:
-    skills: str = ""
+def load_skill_meta(skills_dir: str = SKILLS_DIR) -> list[dict]:
+    """Parse skills/*/SKILL.md frontmatter into [{name, description, path}]."""
+    meta: list[dict] = []
     skills_path = Path(skills_dir)
     if not skills_path.is_dir():
-        return skills
+        return meta
     for skill in os.scandir(skills_path):
         for md_file in Path(skill).glob('**/*.*'):
             text = md_file.read_text(encoding="utf-8")
@@ -457,15 +457,23 @@ def load_skills(skills_dir: str = SKILLS_DIR) -> str:
             parts = text.split("\n---", 1)
             if len(parts) != 2:
                 continue
-            frontmatter, body = parts
+            frontmatter, _body = parts
             fields = {}
             for line in frontmatter.splitlines()[1:]:
                 if ":" in line:
                     key, _, value = line.partition(":")
                     fields[key.strip()] = value.strip()
             if fields.get("name") and fields.get("description"):
-                skills += f"{fields['name']}: {fields['description']}\n"
-    return skills.strip()
+                meta.append({"name": fields["name"],
+                             "description": fields["description"],
+                             "path": str(md_file)})
+    return meta
+
+
+def load_skills(skills_dir: str = SKILLS_DIR) -> str:
+    """The trigger index injected into the system prompt: one 'name: description' per skill."""
+    return "\n".join(f"{s['name']}: {s['description']}"
+                     for s in load_skill_meta(skills_dir)).strip()
 
 SKILLS = load_skills()
 
@@ -492,9 +500,17 @@ class AgentState:
             message_id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id TEXT, turn_number INTEGER,
             tool_name TEXT, role TEXT, content TEXT,
-            tool_call_id TEXT, tool_calls TEXT,
+            tool_call_id TEXT, tool_calls TEXT, reasoning TEXT,
             timestamp TEXT)""")
+        # Additive migration for DBs created before `reasoning` existed; the
+        # INSERT below names its columns, so column order doesn't matter.
+        self._ensure_column("messages", "reasoning", "TEXT")
         self.db.commit()
+
+    def _ensure_column(self, table: str, column: str, decl: str) -> None:
+        existing = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         
     def create_session(self, session_id: str, user_id: str):
         self.db.execute(
@@ -518,22 +534,27 @@ class AgentState:
                         role: str, content: str,
                         tool_name: str = "",
                         tool_call_id: str = "",
-                        tool_calls: list | None = None):
+                        tool_calls: list | None = None,
+                        reasoning: str = ""):
         self.db.execute(
-            "INSERT INTO messages VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages "
+            "(session_id, turn_number, tool_name, role, content, "
+            "tool_call_id, tool_calls, reasoning, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (session_id, turn, tool_name, role, content,
              tool_call_id, json.dumps(tool_calls) if tool_calls else None,
-             dt.now(UTC).isoformat()))
+             reasoning or None, dt.now(UTC).isoformat()))
         self.db.commit()
 
     def get_messages(self, session_id: str) -> list[dict]:
         rows = self.db.execute(
             "SELECT session_id, turn_number, tool_name, role, content, "
-            "tool_call_id, tool_calls FROM messages "
+            "tool_call_id, tool_calls, reasoning FROM messages "
             "WHERE session_id = ? ORDER BY turn_number, message_id",
             (session_id,)).fetchall()
         messages = []
-        for _session_id, _turn_number, tool_name, role, content, tool_call_id, tool_calls in rows:
+        for (_session_id, _turn_number, tool_name, role, content,
+             tool_call_id, tool_calls, reasoning) in rows:
             msg = {"role": role, "content": content}
             if tool_calls:
                 try:
@@ -544,6 +565,10 @@ class AgentState:
                 msg["tool_call_id"] = tool_call_id
             if tool_name:
                 msg["name"] = tool_name
+            if reasoning:
+                # DeepSeek rejects tool-carrying requests whose earlier turns
+                # omit reasoning_content; kept so history can be replayed.
+                msg["reasoning_content"] = reasoning
             messages.append(msg)
         return messages
 
@@ -554,11 +579,13 @@ class AgentState:
 
     
 class AgentHarness:
-    def __init__(self, model, system_prompt: str = "", event_bus=None):
-        self.data = (requests.get("http://192.168.1.92:8080/v1/models").json())
+    def __init__(self, model: str | None = None, system_prompt: str = "",
+                 event_bus=None, provider=None, wrapper=None):
         self.bus = event_bus
-        self.model = model
-        self.wrapper = Wrapper(model)
+        self.provider = (provider if isinstance(provider, providers.Provider)
+                         else providers.get_provider(provider))
+        self.model = self.provider.resolve_model(model)
+        self.wrapper = wrapper or Wrapper(self.model, self.provider)
         self.system_prompt = system_prompt
         self.tools: dict[str, Tool] = {}
         self.skills: str = SKILLS
@@ -567,8 +594,19 @@ class AgentHarness:
         self.session_id = str(uuid.uuid4())
         self.user_id = "local"
         self.state.create_session(self.session_id, self.user_id)
+        # Graph store (README step 7): persistent nodes/edges across sessions.
+        self.graph = GraphStore(GRAPH_DB_PATH)
+        self.conversation_node = self.graph.upsert_node(
+            "conversation", self.session_id,
+            label=f"session {self.session_id[:8]}",
+            properties={"user_id": self.user_id, "model": self.model,
+                        "provider": self.provider.name})
+        for skill in load_skill_meta():
+            self.graph.upsert_node("skill", skill["name"], label=skill["name"],
+                                   properties={"description": skill["description"]})
+        self.memory_digest = self.graph.digest()
         self.turn = 0
-        self.context = self.data["data"][0]["context_length"]
+        self.context = self.provider.resolve_context_length()
         self.usage = 0
         self.input = 0
         self.output = 0
@@ -587,6 +625,113 @@ class AgentHarness:
 
     def register_tool(self, tool: Tool):
         self.tools[tool.name] = tool
+        try:
+            self.graph.upsert_node("tool", tool.name, label=tool.name,
+                                   properties={"description": (tool.description or "")[:400]})
+        except Exception:
+            pass
+
+    # -- graph store (README step 7) ------------------------------------
+    def _record_turn_graph(self, user_input: str):
+        """Create the turn's task + user-message nodes, created_in this conversation."""
+        try:
+            task = self.graph.upsert_node(
+                "task", f"{self.session_id}:{self.turn}",
+                label=(user_input or "").strip()[:120] or "(empty)",
+                properties={"turn": self.turn}, session_id=self.session_id)
+            self.graph.touch_edge(task, self.conversation_node, "created_in",
+                                  session_id=self.session_id)
+            self._record_message_graph("user", user_input, 0)
+            return task
+        except Exception:
+            return None
+
+    def _record_message_graph(self, role: str, content: str, index: int) -> None:
+        try:
+            node = self.graph.upsert_node(
+                "message", f"{self.session_id}:{self.turn}:{role}:{index}",
+                label=role, properties={"role": role, "preview": (content or "")[:200]},
+                session_id=self.session_id)
+            self.graph.touch_edge(node, self.conversation_node, "created_in",
+                                  session_id=self.session_id)
+        except Exception:
+            pass
+
+    def _record_tool_graph(self, name: str, duration_ms: int, success: bool,
+                           task_node=None) -> None:
+        try:
+            node = self.graph.upsert_node("tool", name, label=name)
+            inc = {"count": 1, "last_ms": duration_ms}
+            self.graph.touch_edge(node, self.conversation_node, "used_in",
+                                  session_id=self.session_id, increments=inc)
+            self.graph.touch_edge(node, self.conversation_node,
+                                  "succeeded" if success else "failed",
+                                  session_id=self.session_id, increments=inc)
+            if task_node is not None:
+                self.graph.touch_edge(task_node, node, "used_in",
+                                      session_id=self.session_id, increments=inc)
+        except Exception:
+            pass
+
+    def graph_query(self, kind: str = "summary", name: str = "", limit: int = 10) -> str:
+        """Query the cross-session knowledge graph (see graph_store.GraphStore.query)."""
+        try:
+            return self.graph.query(kind=kind, name=name, limit=int(limit or 10))
+        except Exception as e:
+            return f"graph query failed: {type(e).__name__}: {e}"
+
+    # -- runtime switching (the /provider and /model commands) -----------
+    def status_line(self) -> str:
+        """One line describing the backend the next turn will talk to."""
+        return (f"{self.provider.label} · {self.model} · "
+                f"{self.context:,} ctx · auth={self.provider.api_key_env}")
+
+    def available_providers(self) -> list[str]:
+        return list(providers.PROVIDER_NAMES)
+
+    def available_models(self, timeout: float = 5.0) -> list[str]:
+        """Model ids the current provider advertises (best-effort)."""
+        return self.provider.list_models(timeout)
+
+    def _sync_conversation_node(self) -> None:
+        """Keep the graph's conversation node describing the current backend."""
+        try:
+            self.graph.upsert_node(
+                "conversation", self.session_id,
+                label=f"session {self.session_id[:8]}",
+                properties={"user_id": self.user_id, "model": self.model,
+                            "provider": self.provider.name})
+        except Exception:
+            pass
+
+    def switch_provider(self, name: str | None = None, model: str | None = None) -> str:
+        """Point the harness at another backend, in place.
+
+        Only the endpoint, auth and thinking dialect change: the tool registry,
+        session id, message history, budget counters and graph all survive, so
+        the next turn simply talks to the new provider. Switching mid-session is
+        safe — the graph replay rules differ per provider (providers.py), and the
+        wrapper applies the new provider's dialect on the very next request.
+        """
+        provider = providers.get_provider(name)
+        self.provider = provider
+        self.model = provider.resolve_model(model)
+        self.wrapper.provider = provider
+        self.wrapper.model = self.model
+        self.context = provider.resolve_context_length()
+        self.budgeter.budget = self.context
+        self._sync_conversation_node()
+        return self.status_line()
+
+    def switch_model(self, model: str) -> str:
+        """Switch model within the current provider (endpoint/auth unchanged)."""
+        model = (model or "").strip()
+        if not model:
+            raise ValueError("no model given")
+        self.model = model
+        self.wrapper.model = model
+        self._sync_conversation_node()
+        return self.status_line()
 
     def tool_list(self) -> list[dict]:
         return [
@@ -639,10 +784,22 @@ class AgentHarness:
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "system", "content": self.skills},
-            *self.state.get_messages(self.session_id),
+        ]
+        if getattr(self, "memory_digest", ""):
+            messages.append({"role": "system",
+                             "content": "CROSS-SESSION MEMORY (graph store)\n" + self.memory_digest})
+        history = self.state.get_messages(self.session_id)
+        if not self.provider.reasoning_replay:
+            # mlx-serve doesn't want prior chain-of-thought echoed back into the
+            # prompt (it would only burn context); DeepSeek requires it.
+            for past in history:
+                past.pop("reasoning_content", None)
+        messages += [
+            *history,
             {"role": "user", "content": user_input},
         ]
         self.state.record_message(self.session_id, self.turn, "user", user_input)
+        task_node = self._record_turn_graph(user_input)
         for i in range(self.max_iterations):
             self._emit("thinking", iteration=i)
             streamed = {"tokens": 0}
@@ -674,7 +831,10 @@ class AgentHarness:
             self.state.record_message(
                 self.session_id, self.turn, "assistant", response.content or "",
                 tool_calls=response.message.get("tool_calls") if isinstance(response.message, dict) else None,
+                reasoning=reasoning,
             )
+            if response.content:
+                self._record_message_graph("assistant", response.content, i)
             self.input += response.stats.get("prompt_tokens", 0)
             self.output += response.stats.get("completion_tokens", 0)
             self.budgeter.tokens_used = response.stats.get("prompt_tokens", 0)
@@ -684,6 +844,8 @@ class AgentHarness:
             if not response.tool_calls:
                 self._emit("done", content=response.content or "")
                 return response.content
+            if not self.provider.reasoning_replay and isinstance(response.message, dict):
+                response.message.pop("reasoning_content", None)
             messages.append(response.message)
             for call in response.tool_calls:
                 self._emit("tool_call", call_id=str(call.call_id), name=call.name, args=call.args)
@@ -703,6 +865,7 @@ class AgentHarness:
                 self.state.record_tool_invocation(
                     str(call.call_id), self.session_id, self.turn, call.name, call.args,
                     str(result), success, duration_ms)
+                self._record_tool_graph(call.name, duration_ms, success, task_node)
                 self.state.record_message(
                     self.session_id, self.turn, "tool", str(result),
                     tool_name=call.name, tool_call_id=str(call.call_id))
@@ -782,9 +945,10 @@ def _apply_stream_event(acc: dict, event: dict) -> tuple[list[str], list[str]]:
     if delta.get("content"):
         acc["content"].append(delta["content"])
         content_tokens.append(delta["content"])
-    if delta.get("reasoning_content"):
-        acc["reasoning"].append(delta["reasoning_content"])
-        reasoning_tokens.append(delta["reasoning_content"])
+    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+    if reasoning:
+        acc["reasoning"].append(reasoning)
+        reasoning_tokens.append(reasoning)
     for tc in delta.get("tool_calls") or []:
         idx = tc.get("index", len(acc["tool_calls"]))
         while len(acc["tool_calls"]) <= idx:
@@ -822,61 +986,77 @@ def _estimate_tokens(*texts: str) -> int:
     return total
 
 
-def _enable_thinking_param() -> dict:
-    """Request reasoning/thinking from mlx-serve via ``enable_thinking``.
-
-    Off by setting MLX_ENABLE_THINKING=0. The param only matters for reasoning-
-    capable models and is harmless to others, but a server that rejects unknown
-    params gets a retry without it (see chat_streamed).
-    """
-    value = os.getenv("MLX_ENABLE_THINKING", "1").lower().strip()
-    if value in ("0", "false", "no", "off"):
-        return {}
-    return {"enable_thinking": True}
-
-
 class Wrapper:
-    def __init__(self, model):
+    """OpenAI-compatible chat client for the active :class:`providers.Provider`.
+
+    The provider owns the endpoint, the auth env var, and the backend-specific
+    thinking flags (see providers.py); this class only speaks the wire format.
+    """
+
+    def __init__(self, model, provider=None):
         self.model = model
+        self.provider = provider or providers.get_provider()
         self.tool_id = 1
 
-    def chat(self, messages: list[dict], tools: list[dict] = None, skills: dict = None) -> LLMResponse:
+    def _headers(self) -> dict | None:
+        """Auth headers, or None when the provider's API key is missing."""
         try:
-            r = requests.post("http://192.168.1.92:8080/v1/chat/completions", 
-                headers={"authorization" : "Bearer " + os.getenv("API_KEY"),},
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "tools": tools,
-                })
+            return self.provider.headers()
+        except KeyError:
+            return None
+
+    def _missing_key(self) -> LLMResponse:
+        return self._error_response(
+            f"{self.provider.api_key_env} is not set — add it to .env to use the "
+            f"'{self.provider.name}' provider ({self.provider.label}).")
+
+    def chat(self, messages: list[dict], tools: list[dict] = None, skills: dict = None,
+             _allow_thinking: bool = True) -> LLMResponse:
+        headers = self._headers()
+        if headers is None:
+            return self._missing_key()
+        thinking = self.provider.thinking_params() if _allow_thinking else {}
+        payload = {"model": self.model, "messages": messages, "tools": tools}
+        payload.update(thinking)
+        try:
+            r = requests.post(self.provider.chat_url, headers=headers,
+                              json=payload, timeout=(15, 600))
         except requests.exceptions.RequestException as e:
             return self._error_response(f"Request to LLM server failed: {e}")
+        if r.status_code == 400 and thinking:
+            # Server rejects our thinking flags: retry once without them.
+            return self.chat(messages, tools, skills, _allow_thinking=False)
         return self.parse_response(r)
 
     def chat_streamed(self, messages: list[dict], tools: list[dict] = None,
                       on_token=None, on_reasoning=None,
                       _allow_thinking: bool = True) -> LLMResponse:
         """SSE streaming chat. Delivers content tokens to on_token and reasoning
-        tokens (mlx-serve's ``reasoning_content``) to on_reasoning as they
-        arrive, and returns the SAME LLMResponse shape as chat(). Thinking is
-        requested via ``enable_thinking`` unless MLX_ENABLE_THINKING=0; if the
-        server rejects that param (HTTP 400) it retries once without it. Falls
-        back to chat() when the server doesn't actually stream (non-SSE body),
-        or when the request fails before any data arrives."""
+        tokens (``reasoning_content`` — mlx-serve and DeepSeek both use that
+        field) to on_reasoning as they arrive, and returns the SAME LLMResponse
+        shape as chat(). Thinking is requested with the active provider's dialect
+        (``enable_thinking`` for mlx-serve, ``thinking``/``reasoning_effort`` for
+        DeepSeek); if the server rejects those (HTTP 400) it retries once without
+        them. Falls back to chat() when the server doesn't actually stream
+        (non-SSE body), or when the request fails before any data arrives."""
+        headers = self._headers()
+        if headers is None:
+            return self._missing_key()
+        thinking = self.provider.thinking_params() if _allow_thinking else {}
         payload = {"model": self.model, "messages": messages, "tools": tools,
                    "stream": True}
-        if _allow_thinking:
-            payload.update(_enable_thinking_param())
+        payload.update(self.provider.stream_usage_param())
+        payload.update(thinking)
         try:
             r = requests.post(
-                "http://192.168.1.92:8080/v1/chat/completions",
-                headers={"authorization": "Bearer " + os.getenv("API_KEY", "")},
+                self.provider.chat_url,
+                headers=headers,
                 json=payload, stream=True, timeout=(15, 600),
             )
         except requests.exceptions.RequestException as e:
             return self._error_response(f"Request to LLM server failed: {e}")
         if r.status_code != 200:
-            if r.status_code == 400 and _allow_thinking and "enable_thinking" in payload:
+            if r.status_code == 400 and thinking:
                 return self.chat_streamed(messages, tools, on_token, on_reasoning,
                                           _allow_thinking=False)
             return self.parse_response(r)
@@ -990,13 +1170,10 @@ class Wrapper:
         )
 
 
-_LLM_MODEL = "3833d0220ac862d6de38448c0cd414bd2ca29d00"
-
-
-def _build_harness(event_bus=None):
+def _build_harness(event_bus=None, provider=None, model=None):
     """Construct the harness with tools + logging (shared by REPL and TUI)."""
     iso_time = dt.now().isoformat()
-    a = AgentHarness(_LLM_MODEL, SYS_PROMPT, event_bus=event_bus)
+    a = AgentHarness(model, SYS_PROMPT, event_bus=event_bus, provider=provider)
     handlers = {
         "websearch": websearch,
         "read_file": read_file,
@@ -1008,6 +1185,7 @@ def _build_harness(event_bus=None):
         "search_files": search_files,
         "bash": run_bash,
         "memory_note": memory_note,
+        "graph_query": a.graph_query,
         "subagent": a.run_subagent,
     }
     for tool in load_tools("tools.json", handlers):
@@ -1022,6 +1200,7 @@ def _build_harness(event_bus=None):
 def _run_repl(harness):
     """Original plain-text REPL (default)."""
     print(logo)
+    print(f"  {harness.status_line()}")
     while True:
         print("-" * 50)
         try:
@@ -1030,8 +1209,35 @@ def _run_repl(harness):
             print()
             break
         logger.info(user_in)
-        if user_in == '/stop' or user_in == '/s':
+        cmd, _, arg = user_in.strip().partition(" ")
+        cmd, arg = cmd.lower(), arg.strip()
+        if cmd in ('/stop', '/s'):
             break
+        if cmd in ('/graph', '/g'):
+            print(harness.graph.query("summary"))
+            continue
+        if cmd in ('/provider', '/p'):
+            if not arg:
+                print(harness.status_line())
+                print("available: " + ", ".join(harness.available_providers()))
+                continue
+            try:
+                print("switched -> " + harness.switch_provider(arg))
+            except ValueError as e:
+                print(f"error: {e}")
+            continue
+        if cmd in ('/model', '/m'):
+            if not arg:
+                print(f"model: {harness.model}")
+                models = harness.available_models()
+                if models:
+                    print("available: " + ", ".join(models))
+                continue
+            try:
+                print("switched -> " + harness.switch_model(arg))
+            except ValueError as e:
+                print(f"error: {e}")
+            continue
         response = harness.run(user_in)
         print(response)
         print("-" * 50)
@@ -1047,18 +1253,28 @@ if __name__ == "__main__":
     )
     parser.add_argument("--tui", action="store_true",
                         help="run the animated PLEIADES TUI instead of the plain REPL")
+    parser.add_argument("--provider", choices=list(providers.PROVIDER_NAMES), default=None,
+                        help="LLM backend: 'local' (mlx-serve on the LAN) or 'deepseek' "
+                             "(api.deepseek.com). Defaults to $PLEIADES_PROVIDER, else 'local'.")
+    parser.add_argument("--model", default=None,
+                        help="Override the model name for the chosen provider "
+                             "(defaults to $LLM_MODEL / $DEEPSEEK_MODEL, else the provider default).")
     args = parser.parse_args()
 
-    if args.tui:
-        try:
-            from tui import run_tui
-        except ImportError:
-            print("The TUI needs 'rich'. Install it with:  pip install rich")
-            raise SystemExit(1)
-        try:
-            run_tui()
-        except KeyboardInterrupt:
-            print()
-        raise SystemExit(0)
+    try:
+        if args.tui:
+            try:
+                from tui import run_tui
+            except ImportError:
+                print("The TUI needs 'rich'. Install it with:  pip install rich")
+                raise SystemExit(1)
+            try:
+                run_tui(provider=args.provider, model=args.model)
+            except KeyboardInterrupt:
+                print()
+            raise SystemExit(0)
 
-    _run_repl(_build_harness())
+        _run_repl(_build_harness(provider=args.provider, model=args.model))
+    except ValueError as e:  # bad provider name, unknown model, etc.
+        print(f"error: {e}")
+        raise SystemExit(2)

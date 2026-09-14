@@ -153,7 +153,7 @@
             "type": "function",
             "function": {
                 "name": "run_shell",
-                "description": "Run a single command from the pre-approved allow list (git, pytest, pip, python, ls, cat, echo, pwd, wc, grep, find). Runs immediately with no prompting. Use for simple, safe checks only; for anything needing pipes, &&, redirects, globs, or arbitrary commands use 'bash' instead. Execute the command yourself — never ask the user to run commands for you.",
+                "description": "Run a single command from a fixed allow list (git, pytest, pip, python, python3, ls, cat, echo, pwd, wc, grep, find), with no shell interpretation and confined to the working directory. Runs immediately; a command outside the list is refused without prompting. The allow list is a convenience filter, NOT a security boundary — 'bash' can run anything this tool refuses. Use for simple, safe checks only; for pipes, &&, redirects, globs, or arbitrary commands use 'bash' instead. Execute the command yourself — never ask the user to run commands for you.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -242,6 +242,33 @@
                         }
                     },
                     "required": ["mode"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "graph_query",
+                "description": "Query the cross-session knowledge graph — relationships plain SQL won't answer well: which tools/skills have been used before (and how often, with what success), node lineage, which tools are used together across sessions, recent sessions and tasks, and free-text search over past nodes. Use it to recall work from previous sessions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["summary", "tools", "skills", "sessions", "tasks", "lineage", "cooccurrence", "search"],
+                            "description": "Which query: 'summary' overview; 'tools' tool usage/success stats; 'skills' available skills; 'sessions' recent conversations; 'tasks' recent tasks; 'lineage' a node's edges (pass name); 'cooccurrence' tools used together; 'search' find nodes by text (pass name)."
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Node key/name for 'lineage' (a tool or skill), or the text for 'search'. Optional otherwise."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum rows to return. Omit for the default (10)."
+                        }
+                    },
+                    "required": ["kind"],
                     "additionalProperties": false
                 }
             }
