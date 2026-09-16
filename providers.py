@@ -41,7 +41,7 @@ class Provider:
     context_length: int
     model_env: str
     base_url_env: str | None = None
-    thinking_style: str = "none"       # none | enable_thinking | reasoning_effort
+    thinking_style: str = "none"       # none | enable_thinking | reasoning_effort | openrouter
     models_endpoint: bool = False      # GET /models to discover context_length
     reasoning_replay: bool = False     # echo reasoning_content back when tools sent
     stream_usage: bool = True          # ask for usage on the final SSE chunk
@@ -129,11 +129,18 @@ class Provider:
             if effort in ("none", "off", "0", "false"):
                 return {"reasoning_effort": "none"}
             return {"thinking": {"type": "enabled"}, "reasoning_effort": effort}
+        if self.thinking_style == "openrouter":
+            effort = (os.getenv("OPENROUTER_REASONING_EFFORT", "").strip().lower()
+                      or self.default_reasoning_effort)
+            if effort in ("none", "off", "0", "false"):
+                return {"reasoning": {"enabled": False}}
+            return {"reasoning": {"effort": effort}}
         return {}
 
     def thinking_label(self, provider=None) -> str:
         """The active thinking level, mirroring presentation.thinking_label,
-        with ``reasoning_effort: none`` normalised to ``off``."""
+        with the off dialects (``reasoning_effort: none``, ``reasoning:
+        {enabled: False}``) normalised to ``off``."""
         try:
             params = self.thinking_params()
         except Exception:
@@ -141,6 +148,12 @@ class Provider:
         if "reasoning_effort" in params:
             effort = str(params["reasoning_effort"])
             return "off" if effort in ("none", "off") else effort
+        reasoning = params.get("reasoning")
+        if isinstance(reasoning, dict):
+            if reasoning.get("enabled") is False:
+                return "off"
+            effort = reasoning.get("effort")
+            return str(effort) if effort else "on"
         return "on" if params.get("enable_thinking") else "off"
 
     def stream_usage_param(self) -> dict:
@@ -149,9 +162,9 @@ class Provider:
     # ---- thinking control ----------------------------------------------
     def thinking_levels(self) -> list[str]:
         """Levels this backend accepts, for /thinking suggestions."""
-        if self.thinking_style == "enable_thinking":
+        if self.thinking_style in ("enable_thinking",):
             return ["on", "off"]
-        if self.thinking_style == "reasoning_effort":
+        if self.thinking_style in ("reasoning_effort", "openrouter"):
             return ["off", "low", "medium", "high"]
         return []
 
@@ -170,12 +183,15 @@ class Provider:
             if level not in ("on", "off"):
                 raise ValueError("level must be on|off for this provider")
             os.environ["MLX_ENABLE_THINKING"] = "1" if level == "on" else "0"
-        elif self.thinking_style == "reasoning_effort":
+        elif self.thinking_style in ("reasoning_effort", "openrouter"):
             if level not in ("off", "none", "low", "medium", "high"):
                 raise ValueError("level must be off|low|medium|high for this provider")
             if level == "none":
                 level = "off"
-            os.environ["DEEPSEEK_REASONING_EFFORT"] = level
+            if self.thinking_style == "openrouter":
+                os.environ["OPENROUTER_REASONING_EFFORT"] = level
+            else:
+                os.environ["DEEPSEEK_REASONING_EFFORT"] = level
         else:
             raise ValueError("this provider has no thinking control")
         return self.thinking_label(self)
@@ -209,6 +225,21 @@ PROVIDERS: dict[str, Provider] = {
         thinking_style="reasoning_effort",
         models_endpoint=False,
         reasoning_replay=True,
+        stream_usage=True,
+    ),
+    "openrouter": Provider(
+        name="openrouter",
+        label="OpenRouter",
+        base_url="https://openrouter.ai/api/v1",
+        base_url_env="OPENROUTER_BASE_URL",
+        api_key_env="OPENROUTER_API",
+        api_key_env_fallbacks=("OPENROUTER_API_KEY",),
+        default_model="openrouter/auto",
+        model_env="OPENROUTER_MODEL",
+        context_length=128_000,
+        thinking_style="openrouter",
+        models_endpoint=True,          # /models reports context_length per model
+        reasoning_replay=False,
         stream_usage=True,
     ),
 }

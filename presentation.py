@@ -100,7 +100,15 @@ def thinking_label(provider) -> str:
     except Exception:
         return ""
     if "reasoning_effort" in params:
-        return str(params["reasoning_effort"])
+        effort = str(params["reasoning_effort"])
+        return "off" if effort in ("none", "off") else effort
+    reasoning = params.get("reasoning")
+    if isinstance(reasoning, dict):
+        # OpenRouter dialect: {"reasoning": {"effort": ...}} or {"enabled": False}
+        if reasoning.get("enabled") is False:
+            return "off"
+        effort = reasoning.get("effort")
+        return str(effort) if effort else "on"
     return "on" if params.get("enable_thinking") else "off"
 
 

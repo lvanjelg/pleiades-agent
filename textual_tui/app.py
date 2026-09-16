@@ -27,7 +27,8 @@ from textual.widgets.option_list import Option
 from presentation import MD_COLOR as MD, PI, format_tokens, thinking_label
 from textual_tui.events import DeferredSink, HarnessEvent, TextualSink
 from textual_tui.model import Transcript
-from textual_tui.widgets import StatusLine, Transcript as TranscriptView, TurnWidget
+from textual_tui.widgets import (CommandSuggester, StatusLine,
+                                 Transcript as TranscriptView, TurnWidget)
 from ux import EventKind
 
 USER_BG = PI["userMessageBg"]
@@ -297,7 +298,8 @@ class PleiadesApp(App[None]):
         yield StatusLine()
         with Horizontal(id="prompt-row"):
             yield Label("pleiades ›", id="prompt-marker")
-            yield Input(placeholder="message or /command", id="prompt")
+            yield Input(placeholder="message or /command", id="prompt",
+                        suggester=CommandSuggester(self))
 
     def on_mount(self) -> None:
         self.query_one("#prompt", Input).focus()

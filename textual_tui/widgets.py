@@ -18,10 +18,81 @@ from __future__ import annotations
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.suggester import Suggester
 from textual.widgets import Collapsible, Markdown, Static
 
 from presentation import PI, TOOL_STATE, args_summary, format_tokens, preview
 from textual_tui.model import RUN, ToolRecord, Turn
+
+
+class CommandSuggester(Suggester):
+    """Ghost-text completion for the prompt: slash commands, and — once a
+    command that takes one is recognised — its argument values.
+
+    Built on Textual's ``Input(suggester=...)``: the widget renders the
+    suggestion as dim text after the cursor and ``right``/``end`` accepts it.
+    ``SuggestFromList`` only completes the whole input, which is wrong here —
+    ``/provider dee`` must complete to ``/provider deepseek``, not nothing.
+    Hence a custom ``get_suggestion`` that splits command from argument.
+
+    Caching is disabled: the suggestion depends on live state (provider list,
+    thinking level), not just the typed value.
+    """
+
+    def __init__(self, app) -> None:
+        super().__init__(use_cache=False, case_sensitive=False)
+        self._app = app
+
+    COMMANDS = ("/provider", "/model", "/thinking", "/graph", "/usage",
+                "/clear", "/help", "/stop", "/quit")
+    COMMAND_ARGS = {
+        "/provider": ("local", "deepseek"),
+        "/model": None,               # fetched from the harness, may block
+        "/thinking": ("off", "low", "medium", "high", "on"),
+    }
+
+    def _levels(self) -> tuple[str, ...]:
+        """Thinking levels the live provider accepts, when discoverable."""
+        provider = getattr(self._app.harness, "provider", None)
+        if hasattr(provider, "thinking_levels"):
+            try:
+                return tuple(provider.thinking_levels())
+            except Exception:
+                pass
+        return ()
+
+    def _models(self) -> tuple[str, ...]:
+        """Model ids the harness knows without a network round-trip."""
+        getter = getattr(self._app.harness, "available_models", None)
+        if getter is None:
+            return ()
+        try:
+            return tuple(getter(timeout=0.01))
+        except Exception:
+            return ()
+
+    async def get_suggestion(self, value: str) -> str | None:
+        value = value.lstrip()
+        if not value.startswith("/"):
+            return None
+        # Complete the command itself while it is still one token.
+        head, _, arg = value.partition(" ")
+        if not arg and " " not in value:
+            matches = [c for c in self.COMMANDS if c.startswith(value)]
+            return matches[0] if matches else None
+        if head not in self.COMMAND_ARGS:
+            return None
+        options = self.COMMAND_ARGS[head]
+        if options is None:
+            options = self._models()
+        if head == "/thinking":
+            options = self._levels() or options
+        if not options:
+            return None
+        for option in options:
+            if option.startswith(arg):
+                return f"{head} {option}"
+        return None
 
 
 class UserBand(Vertical):

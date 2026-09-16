@@ -186,6 +186,99 @@ def test_provider_thinking_levels_and_set() -> None:
             os.environ["MLX_ENABLE_THINKING"] = old
 
 
+def test_openrouter_provider() -> None:
+    """OpenRouter: OpenAI shape, its own reasoning dialect, OPENROUTER_API key."""
+    import os
+    import providers
+
+    p = providers.PROVIDERS["openrouter"]
+    assert providers.get_provider("openrouter") is p
+    assert p.chat_url == "https://openrouter.ai/api/v1/chat/completions"
+    assert p.api_key_env == "OPENROUTER_API"
+    assert p.thinking_levels() == ["off", "low", "medium", "high"]
+
+    # Dialect: reasoning.effort, and a real off switch.
+    old = os.environ.get("OPENROUTER_REASONING_EFFORT")
+    try:
+        assert p.thinking_params() == {"reasoning": {"effort": "high"}}
+        assert p.set_thinking("low") == "low"
+        assert os.environ["OPENROUTER_REASONING_EFFORT"] == "low"
+        assert p.thinking_params() == {"reasoning": {"effort": "low"}}
+        assert p.set_thinking("off") == "off"
+        assert p.thinking_params() == {"reasoning": {"enabled": False}}
+        assert p.thinking_label() == "off"
+        assert p.set_thinking("high") == "high"
+        assert p.thinking_label() == "high"
+    finally:
+        if old is None:
+            os.environ.pop("OPENROUTER_REASONING_EFFORT", None)
+        else:
+            os.environ["OPENROUTER_REASONING_EFFORT"] = old
+    try:
+        p.set_thinking("on")   # not a valid effort word
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+    # Key resolution honours the fallback alias.
+    old_key = os.environ.pop("OPENROUTER_API", None)
+    old_alias = os.environ.pop("OPENROUTER_API_KEY", None)
+    try:
+        os.environ["OPENROUTER_API_KEY"] = "alias-key"
+        assert p.api_key() == "alias-key"
+    finally:
+        os.environ.pop("OPENROUTER_API_KEY", None)
+        if old_key is not None:
+            os.environ["OPENROUTER_API"] = old_key
+        if old_alias is not None:
+            os.environ["OPENROUTER_API_KEY"] = old_alias
+
+    # The TUI status line reads the same dialect.
+    from presentation import thinking_label as fmt
+    assert fmt(p) == "high"
+
+
+async def check_prompt_autocomplete() -> None:
+    """The prompt completes slash commands and their arguments.
+
+    Textual's Input(suggester=...) shows the completion as dim ghost text;
+    right/end accepts it. Asserted through the Input._suggestion reactive,
+    which is what the renderer displays.
+    """
+    from textual_tui.widgets import CommandSuggester
+
+    deferred = DeferredSink()
+    app = PleiadesApp(harness=FakeHarness(deferred), logo="")
+    deferred.attach(TextualSink(app))
+
+    # Pure suggester logic first — no app needed.
+    s = CommandSuggester(app)
+    assert await s.get_suggestion("/pro") == "/provider", "command completion"
+    assert await s.get_suggestion("/pro ") is None, "no bare space completion"
+    assert await s.get_suggestion("/provider ") == "/provider local", \
+        "argument completion (first matching option)"
+    assert await s.get_suggestion("/provider deep") == "/provider deepseek"
+    assert await s.get_suggestion("/thinking ") == "/thinking off", \
+        "levels come from the live provider"
+    assert await s.get_suggestion("/bogus ") is None
+    assert await s.get_suggestion("hello") is None, "plain messages never complete"
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        prompt = app.query_one("#prompt")
+        prompt.focus()
+        prompt.value = "/prov"
+        await pilot.pause(0.2)          # suggestion arrives via a worker
+        assert prompt._suggestion == "/provider", prompt._suggestion
+        # Accepting with `right` completes the value...
+        await pilot.press("right")
+        await pilot.pause(0.1)
+        assert prompt.value == "/provider", prompt.value
+        # ...and typing a space then completes the argument.
+        prompt.value = "/provider d"
+        await pilot.pause(0.2)
+        assert prompt._suggestion == "/provider deepseek", prompt._suggestion
+
+
 # --------------------------------------------------------------------- sinks
 def test_sink_forwards_and_deferred_buffers() -> None:
     seen: list[tuple] = []
@@ -821,9 +914,11 @@ def main() -> None:
     print("  ok  tool calls inline (event order, expand on click, live args)")
     asyncio.run(check_tool_output_is_not_markup())
     print("  ok  tool output is not markup (the MarkupError crash)")
+    asyncio.run(check_prompt_autocomplete())
+    print("  ok  prompt autocomplete (commands + arguments, ghost text)")
     asyncio.run(check_real_harness())
     print("  ok  real harness (banner, status, provider picker)")
-    print(f"\n{len(tests) + 9} checks passed")
+    print(f"\n{len(tests) + 10} checks passed")
 
 
 if __name__ == "__main__":
