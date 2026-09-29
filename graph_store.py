@@ -301,6 +301,10 @@ class GraphStore:
             labels = [t["label"][:60] for t in recent_tasks if t["label"]]
             if labels:
                 lines.append("- recent tasks: " + " | ".join(labels))
+        artifacts = self.nodes(type="artifact", limit=limit)
+        if artifacts:
+            lines.append("- your created artifacts: " + ", ".join(
+                f"{a['key']} [{a['properties'].get('tier', '?')}]" for a in artifacts))
         lines.append("- use the graph_query tool to explore tools/skills/lineage across sessions")
         return "\n".join(lines)
 
@@ -372,5 +376,12 @@ class GraphStore:
             if not hits:
                 return f"No nodes matching '{name}'."
             return "\n".join(f"- {h['type']}:{h['key']} ({h['label'][:60]})" for h in hits)
+        if kind == "artifacts":
+            arts = self.nodes(type="artifact", limit=limit)
+            if not arts:
+                return "No created artifacts recorded."
+            return "\n".join(
+                f"- {a['key']} [{a['properties'].get('tier', '?')}] "
+                f"{a['properties'].get('description', '')[:80]}" for a in arts)
         return ("Unknown kind. Use one of: summary, tools, skills, sessions, tasks, "
-                "lineage, cooccurrence, search.")
+                "lineage, cooccurrence, artifacts, search.")

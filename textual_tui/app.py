@@ -83,6 +83,7 @@ HELP_TEXT = """\
     /provider /p [name]   show or switch backend
     /model /m [name]      show or switch model
     /graph /g             cross-session graph summary
+    /artifacts /art [cmd] capabilities you created (list|show|promote|prune)
     /usage /u             token usage and context
     /clear /c             clear the transcript
     /thinking /t [level]  show or set thinking (off|low|medium|high or on|off)
@@ -108,6 +109,7 @@ PALETTE = [
     ("/provider", "Switch provider"),
     ("/model", "Switch model"),
     ("/graph", "Show graph summary"),
+    ("/artifacts", "Show created capabilities"),
     ("/usage", "Show usage"),
     ("/clear", "Clear transcript"),
     ("/thinking", "Set thinking level"),
@@ -143,17 +145,18 @@ class PickerScreen(ModalScreen[str]):
 
 
 class GraphScreen(ModalScreen[None]):
-    """Cross-session graph digest, scrollable and selectable."""
+    """Text report in a dialog, scrollable and selectable (graph, artifacts)."""
 
     BINDINGS = [Binding("escape", "close", "close"), Binding("q", "close", "close")]
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, title: str = "cross-session graph") -> None:
         super().__init__()
         self._text = text
+        self._title = title
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog"):
-            yield Label("cross-session graph", classes="dialog-title")
+            yield Label(self._title, classes="dialog-title")
             with VerticalScroll():
                 yield Static(self._text, id="graph-body")
 
@@ -470,6 +473,8 @@ class PleiadesApp(App[None]):
             self._show_usage()
         elif command in ("/graph", "/g"):
             self._show_graph()
+        elif command in ("/artifacts", "/art"):
+            self._show_artifacts(arg)
         elif command in ("/provider", "/p"):
             self._provider_command(arg)
         elif command in ("/model", "/m"):
@@ -492,6 +497,14 @@ class PleiadesApp(App[None]):
         # Uses the guarded harness wrapper: the legacy frontend called
         # harness.graph.query directly and would crash on any store error.
         self.push_screen(GraphScreen(self.harness.graph_query("summary")))
+
+    def _show_artifacts(self, arg: str) -> None:
+        try:
+            text = self.harness.artifact_command(arg)
+        except Exception as exc:  # a store error must not kill the app
+            self.notify(f"{type(exc).__name__}: {exc}", title="error", severity="error")
+            return
+        self.push_screen(GraphScreen(text, "created artifacts"))
 
     def _provider_command(self, arg: str) -> None:
         if arg:

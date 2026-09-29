@@ -162,8 +162,7 @@ class ScriptedWrapper:
         return pleiades.LLMResponse(
             content=self.reply, tool_calls=[],
             message={"role": "assistant", "content": self.reply},
-            response_id="scripted",
-            stats={"prompt_tokens": 5, "completion_tokens": 2}, output=[])
+            stats={"prompt_tokens": 5, "completion_tokens": 2})
 
 
 def _session_rows(harness) -> int:

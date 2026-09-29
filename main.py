@@ -8,17 +8,16 @@ import os
 import logging
 from pathlib import Path
 import uuid
-from pathlib import Path
-from dotenv import load_dotenv, dotenv_values 
-from typing import Callable, Any
-from dataclasses import dataclass, field
+from dotenv import load_dotenv
+from typing import Callable
+from dataclasses import dataclass
 import time
 import sqlite3
 import threading
 from datetime import datetime as dt, UTC
-from enum import Enum
 from graph_store import GraphStore
 import providers
+import creation
 load_dotenv() 
 logger = logging.getLogger(__name__)
 LOG_DIR = "logs/"
@@ -49,18 +48,13 @@ class ToolCall:
     call_id: int | str
     name: str
     args: dict
-    output: str = ""
-    error: str = ""
-    provider_info: dict = field(default_factory=dict)
 
 @dataclass
 class LLMResponse:
     content: str
     tool_calls: list
     message: dict
-    response_id: str
     stats: dict
-    output: list
 
 @dataclass
 class Tool:
@@ -68,24 +62,6 @@ class Tool:
     description: str
     parameters: dict  # JSON Schema
     fn: Callable
-
-class ErrorType(Enum):
-    TRANSIENT = "transient"
-    PERMANENT = "permanent"
-    UNAVAILABLE = "unavailable"
-
-@dataclass
-class ToolError:
-    error_type: ErrorType
-    message: str
-    suggestion: str
-
-def format_tool_error(error: ToolError) -> str:
-    parts = [f"[TOOL ERROR: {error.error_type.value.upper()}]"]
-    parts.append(error.message)
-    if error.suggestion:
-        parts.append(f"Suggested action: {error.suggestion}")
-    return "\n".join(parts)
 
 '''
 Tracks token usage and tool calls, checks for budget limits and prevents excessive usage
@@ -115,32 +91,6 @@ class BudgetEnforcer:
         if time.time() - self.start_time >= self.max_time:
             return "Time budget exceeded"
         return None
-
-
-class ToolRegistry:
-    def __init__(self):
-        self.tools: dict[str, Tool] = {}
-        self.call_counts: dict[str, int] = {}
-
-    def register(self, tool: Tool):
-        self.tools[tool.name] = tool
-        self.call_counts[tool.name] = 0
-
-    def validate_call(self, tool_name: str, arguments: dict) -> tuple[bool, str]:
-        if tool_name not in self.tools:
-            return False, f"Unknown tool: {tool_name}"
-        schema = self.tools[tool_name].parameters
-        for field in schema.get("required", []):
-            if field not in arguments:
-                return False, f"Missing required parameter: {field}"
-        for arg_name, arg_value in arguments.items():
-            if arg_name not in schema.get("properties", {}):
-                return False, f"Unexpected parameter: {arg_name}"
-        return True, "OK"
-
-    def execute(self, tool_name: str, arguments: dict) -> Any:
-        self.call_counts[tool_name] += 1
-        return self.tools[tool_name].fn(**arguments)
 
 
 def websearch(query: str, search_depth: str = "basic", freshness: str | None = None) -> str:
@@ -543,6 +493,11 @@ def load_skills(skills_dir: str = SKILLS_DIR) -> str:
                      for s in load_skill_meta(skills_dir)).strip()
 
 SKILLS = load_skills()
+#: Skills already injected at import. The created-skill index excludes exactly
+#: these: a skill promoted mid-session lands in skills/ and would otherwise be
+#: dropped from the index (it is on disk) without yet being in SKILLS (it is not
+#: in the baseline) -- invisible until the documented restart.
+SKILL_NAMES = {s["name"] for s in load_skill_meta()}
 
 '''
 Creates agent DB with SQLite to track sessions and tool invocations and provide analytics
@@ -672,6 +627,20 @@ class AgentHarness:
             self.graph.upsert_node("skill", skill["name"], label=skill["name"],
                                    properties={"description": skill["description"]})
         self.memory_digest = self.graph.digest()
+        # Creation pipeline (README steps 8-10): self-authored tools, skills and
+        # SOPs. It shares the harness SQLite file, runs created tools in a
+        # subprocess, and reaches back into the harness only through the injected
+        # callables below — so it has no import cycle and is testable standalone.
+        self.creation = creation.CreationPipeline(
+            creation.CreationStore(GRAPH_DB_PATH),
+            resolve_safe_path, WORKING_ROOT,
+            known_tools=lambda: set(self.tools),
+            known_skills=lambda: {s["name"] for s in load_skill_meta()},
+            wrapper=lambda: self.wrapper,
+            tool_schemas=self.tool_list,
+            session_id=lambda: self.session_id,
+        )
+        self.skills = self._skill_index()
         self.turn = 0
         self.context = self.provider.resolve_context_length()
         self.usage = 0
@@ -782,6 +751,126 @@ class AgentHarness:
             return self.graph.query(kind=kind, name=name, limit=int(limit or 10))
         except Exception as e:
             return f"graph query failed: {type(e).__name__}: {e}"
+
+    # -- creation pipeline (README steps 8-10) ---------------------------
+    def _skill_index(self) -> str:
+        """The skills system message: on-disk skills plus live created ones.
+
+        Provisional created skills are listed so they are usable before
+        promotion; promoted SOPs are listed as read-only playbooks. On-disk names
+        are excluded so a promoted skill is never listed twice.
+        """
+        extra = self.creation.skill_index(exclude=SKILL_NAMES)
+        return f"{SKILLS}\n{extra}" if extra else SKILLS
+
+    def load_created_tools(self) -> int:
+        """Register every live created tool (provisional + promoted).
+
+        Called once after the hand-written tools load. A hand-written tool always
+        wins a name collision: the pipeline already refuses to create one under an
+        existing name, and this is the second line of defence.
+        """
+        loaded = 0
+        for name, description, parameters, fn in self.creation.registrable_tools():
+            if name in self.tools:
+                continue
+            self.register_tool(Tool(name=name, description=description,
+                                    parameters=parameters, fn=fn))
+            loaded += 1
+        return loaded
+
+    def create_artifact(self, kind: str, name: str, description: str,
+                        spec: dict | None = None, tests: list | None = None) -> str:
+        """Tool handler: draft → validate → provisional register (steps 8-10)."""
+        result = self.creation.create(kind, name, description, spec, tests)
+        if result.ok:
+            if result.kind == "tool":
+                self._register_created_tool(result.name, description)
+            self._record_artifact_graph(result)
+            self.skills = self._skill_index()
+        return str(result)
+
+    def _register_created_tool(self, name: str, description: str) -> None:
+        if name in self.tools:
+            return
+        row = self.creation.store.get("tool", name)
+        parameters = ((row or {}).get("payload") or {}).get("parameters") \
+            or {"type": "object", "properties": {}}
+        self.register_tool(Tool(name=name, description=description,
+                                parameters=parameters,
+                                fn=self.creation.tool_callable(name)))
+
+    def artifact_admin(self, action: str, kind: str = "", name: str = "") -> str:
+        """Tool handler: list / show / promote / prune a created artifact."""
+        action, kind, name = (action or "").strip().lower(), (kind or "").strip().lower(), (name or "").strip()
+        if action == "list":
+            return self.creation.listing(kind)
+        if action not in ("show", "promote", "prune"):
+            return "Unknown action. Use list, show, promote or prune."
+        if not kind or not name:
+            return f"{action} needs both kind and name."
+        if action == "show":
+            return str(self.creation.show(kind, name))
+        result = (self.creation.promote(kind, name) if action == "promote"
+                  else self.creation.prune(kind, name))
+        if result.ok:
+            if result.kind == "tool" and action == "prune":
+                self.tools.pop(result.name, None)
+            self._sync_artifact_node(result.kind, result.name, result.tier)
+            self.skills = self._skill_index()
+        return str(result)
+
+    def artifact_command(self, arg: str) -> str:
+        """Shared `/artifacts` handler for both frontends."""
+        parts = (arg or "").split()
+        if not parts or parts[0].lower() == "list":
+            return self.creation.listing(parts[1].lower() if len(parts) > 1 else "")
+        if parts[0].lower() in ("show", "promote", "prune") and len(parts) >= 3:
+            return self.artifact_admin(parts[0], parts[1], parts[2])
+        return ("usage: /artifacts [list [kind]] | show <kind> <name> | "
+                "promote <kind> <name> | prune <kind> <name>")
+
+    def _record_artifact_graph(self, result) -> None:
+        """Lineage for a created artifact: created_in this conversation, plus the
+        composed_of / references edges step 11's router will need."""
+        try:
+            row = self.creation.store.get(result.kind, result.name) or {}
+            node_id = self.graph.upsert_node(
+                "artifact", f"{result.kind}:{result.name}", label=result.name,
+                properties={"kind": result.kind, "tier": result.tier,
+                            "path": result.path,
+                            "description": (row.get("description") or "")[:200]},
+                session_id=self.session_id)
+            if self.conversation_node is not None:
+                self.graph.touch_edge(node_id, self.conversation_node, "created_in",
+                                      session_id=self.session_id)
+            payload = row.get("payload", {})
+            if result.kind == "sop":
+                for step in payload.get("steps") or []:
+                    if "skill" in step:
+                        self._link_artifact(node_id, "skill", str(step["skill"]), "composed_of")
+            elif result.kind == "skill":
+                for tool in payload.get("tools") or []:
+                    self._link_artifact(node_id, "tool", str(tool), "references")
+        except Exception:
+            pass
+
+    def _link_artifact(self, node_id: int, type: str, key: str, relation: str) -> None:
+        target = self.graph.get_node(type, key)
+        target_id = target["id"] if target else self.graph.upsert_node(type, key, label=key)
+        self.graph.touch_edge(node_id, target_id, relation, session_id=self.session_id)
+
+    def _sync_artifact_node(self, kind: str, name: str, tier: str) -> None:
+        try:
+            node = self.graph.get_node("artifact", f"{kind}:{name}")
+            if not node:
+                return
+            props = dict(node["properties"])
+            props["tier"] = tier
+            self.graph.upsert_node("artifact", f"{kind}:{name}", label=node["label"],
+                                   properties=props, session_id=self.session_id)
+        except Exception:
+            pass
 
     # -- runtime switching (the /provider and /model commands) -----------
     def status_line(self) -> str:
@@ -1241,7 +1330,6 @@ class Wrapper:
             calls.append(ToolCall(
                 call_id=call_id, name=name,
                 args=_safe_json(tc["function"].get("arguments", "")),
-                output="", error="", provider_info={},
             ))
         message = {"role": "assistant", "content": content}
         if reasoning:
@@ -1254,19 +1342,11 @@ class Wrapper:
                 for c in calls
             ]
         return LLMResponse(
-            content=content, tool_calls=calls, message=message,
-            response_id="stream", stats=stats, output=[],
+            content=content, tool_calls=calls, message=message, stats=stats,
         )
 
     def _error_response(self, message: str) -> LLMResponse:
-        return LLMResponse(
-            content=message,
-            tool_calls=[],
-            message={},
-            response_id="",
-            stats={},
-            output=[],
-        )
+        return LLMResponse(content=message, tool_calls=[], message={}, stats={})
 
     def parse_response(self, response: requests.Response) -> LLMResponse:
         if response.status_code != 200:
@@ -1293,17 +1373,12 @@ class Wrapper:
                 call_id=call_id,
                 name=fn.get("name", ""),
                 args=args,
-                output="",
-                error="",
-                provider_info={},
             ))
         return LLMResponse(
             content=content,
             tool_calls=tools,
             message=message,
-            response_id=data.get("id", ""),
             stats=data.get("usage", {}),
-            output=[],
         )
 
 
@@ -1324,9 +1399,12 @@ def _build_harness(event_bus=None, provider=None, model=None):
         "memory_note": memory_note,
         "graph_query": a.graph_query,
         "subagent": a.run_subagent,
+        "create_artifact": a.create_artifact,
+        "artifact_admin": a.artifact_admin,
     }
     for tool in load_tools("tools.json", handlers):
         a.register_tool(tool)
+    a.load_created_tools()  # live created tools, after the hand-written ones
     logging.basicConfig(
         level=logging.INFO,
         handlers=[logging.FileHandler(LOG_DIR + "/" + iso_time + "_agent_run.log", mode="w")],
@@ -1350,6 +1428,9 @@ def _run_repl(harness):
         cmd, arg = cmd.lower(), arg.strip()
         if cmd in ('/stop', '/s'):
             break
+        if cmd in ('/artifacts', '/art'):
+            print(harness.artifact_command(arg))
+            continue
         if cmd in ('/graph', '/g'):
             print(harness.graph.query("summary"))
             continue

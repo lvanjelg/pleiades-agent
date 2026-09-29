@@ -256,8 +256,8 @@
                     "properties": {
                         "kind": {
                             "type": "string",
-                            "enum": ["summary", "tools", "skills", "sessions", "tasks", "lineage", "cooccurrence", "search"],
-                            "description": "Which query: 'summary' overview; 'tools' tool usage/success stats; 'skills' available skills; 'sessions' recent conversations; 'tasks' recent tasks; 'lineage' a node's edges (pass name); 'cooccurrence' tools used together; 'search' find nodes by text (pass name)."
+                            "enum": ["summary", "tools", "skills", "sessions", "tasks", "lineage", "cooccurrence", "artifacts", "search"],
+                            "description": "Which query: 'summary' overview; 'tools' tool usage/success stats; 'skills' available skills; 'sessions' recent conversations; 'tasks' recent tasks; 'lineage' a node's edges (pass name); 'cooccurrence' tools used together; 'artifacts' capabilities you created; 'search' find nodes by text (pass name)."
                         },
                         "name": {
                             "type": "string",
@@ -292,6 +292,71 @@
                         }
                     },
                     "required": ["agent", "task"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "create_artifact",
+                "description": "Create a new capability for yourself — a tool, a skill, or an SOP — and put it through draft → validate → provisional. It goes live at once; use artifact_admin to promote or prune. Validation is behavioural: a tool must pass its own 'tests' in a sandbox subprocess (and then runs in one on every call); a skill must produce spec.expected_tools on the held-out spec.example_task in one model call; an SOP may only chain already-promoted skills. Spec by kind — tool: {parameters: JSON-schema object, code: Python defining `def run(**kwargs) -> str`}; skill: {body, tools: [names used], example_task, expected_tools: [names]}; sop: {steps: [{skill|tool, note?}]}. Never wrap an existing tool; never draft a skill without a real held-out example.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "enum": ["tool", "skill", "sop"],
+                            "description": "What you are building: 'tool' (discrete operation), 'skill' (triggered procedure), or 'sop' (fixed playbook of promoted skills)."
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Lowercase identifier, 2-40 chars of [a-z0-9_-], starting with a letter."
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "One single-line sentence. For a skill this is the trigger index re-sent every turn — include the 'Use when…' phrasings."
+                        },
+                        "spec": {
+                            "type": "object",
+                            "description": "Kind-specific body. tool: {parameters, code}. skill: {body, tools, example_task, expected_tools}. sop: {steps}.",
+                            "additionalProperties": true
+                        },
+                        "tests": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                            "description": "Required for kind='tool': each {args: {...}, expect: substring} or {args, expect_exact}, run in the sandbox. A failing case rejects the draft."
+                        }
+                    },
+                    "required": ["kind", "name", "description", "spec"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "artifact_admin",
+                "description": "Manage the capabilities you created with create_artifact: 'list' (tier, use/failure counts), 'show' one, 'promote' to durable/trusted (a skill is copied into skills/ and needs a restart; an SOP re-checks its chained skills), or 'prune' to retire one.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["list", "show", "promote", "prune"],
+                            "description": "What to do. 'list' takes an optional kind filter; the rest need kind and name."
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": ["tool", "skill", "sop"],
+                            "description": "Which kind of artifact. Optional for 'list'."
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "The artifact's name. Required for show/promote/prune."
+                        }
+                    },
+                    "required": ["action"],
                     "additionalProperties": false
                 }
             }

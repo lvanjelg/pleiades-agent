@@ -339,6 +339,9 @@ class FakeHarness:
     def graph_query(self, kind: str = "summary") -> str:
         return "graph digest"
 
+    def artifact_command(self, arg: str) -> str:
+        return "tool:demo [provisional] uses=0 failures=0"
+
     def available_providers(self) -> list[str]:
         return ["local", "deepseek"]
 
@@ -440,6 +443,12 @@ async def check_app() -> None:
         await pilot.press("escape")
         await pilot.pause(0.15)
 
+        await pilot.press(*"/artifacts", "enter")
+        await pilot.pause(0.15)
+        assert type(app.screen_stack[-1]).__name__ == "GraphScreen"
+        await pilot.press("escape")
+        await pilot.pause(0.15)
+
         await pilot.press(*"/model", "enter")
         await pilot.pause(0.5)    # worker thread fetches the catalogue
         assert type(app.screen_stack[-1]).__name__ == "PickerScreen"
@@ -460,6 +469,7 @@ async def check_app() -> None:
         titles = app.palette_titles()
         assert any(t.startswith("/help") for t in titles), titles
         assert any(t.startswith("/model") for t in titles), titles
+        assert any(t.startswith("/artifacts") for t in titles), titles
         assert len(titles) == len(set(titles)), titles
         await pilot.press("ctrl+p")
         await pilot.pause(0.3)

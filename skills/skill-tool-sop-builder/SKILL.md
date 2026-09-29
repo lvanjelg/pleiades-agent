@@ -11,6 +11,13 @@ This is the **meta-skill**: it builds new capabilities for this agent repo. When
 - **Tool** — the smallest blast radius: a JSON-schema function. Registered in `tools.json` (schema) with a matching handler wired in `main.py`. Use for a discrete, repeatable operation, not a procedure.
 - **SOP** — a *fixed, ordered playbook* for a recurring task class, chaining skills (and sometimes raw tool calls) in a fixed order. Only build an SOP from **promoted**, already-validated skills — a rigid workflow built on shaky components is worse than a skill failing on its own.
 
+### Two ways to build — pick the mechanical one when it fits
+
+The harness has a runtime creation pipeline (README steps 8-10) behind two tools. Prefer it: it validates *and* records lineage for you.
+
+- **Created at runtime** — call `create_artifact(kind, name, description, spec, tests)`. It drafts, validates and provisionally registers the artifact. Tools are validated by running their `tests` in a sandbox subprocess (and then run in one on every call); skills by one model call checking `spec.expected_tools` fire on the held-out `spec.example_task`; SOPs by requiring every chained skill to already be **promoted**. Then use `artifact_admin` to `list`, `show`, `promote` or `prune`. Spec shapes are in the tool description. Skills created this way are live in the trigger index immediately and move into `skills/` on promotion.
+- **Shipped with the repo** — code you are *adding to this codebase* (not creating at runtime) still follows the manual path below: a tool is a `tools.json` schema plus a handler in `main.py`, a skill is a `skills/<name>/SKILL.md` file. Both load at startup and are trusted like the rest of the harness.
+
 Read the user's request and state which type you're building (and why) before drafting — the wrong type is the most common failure here. When in doubt: skill (procedures) > tool (operations) > SOP (fixed sequences).
 
 ## The pipeline: interview → draft → validate → promote
@@ -48,7 +55,7 @@ Write the artifact so an agent understands and performs it as intended. The hous
 
 ### Step 3 — Validate
 
-Before you hand it over, verify the artifact will actually load and behave:
+Before you hand it over, verify the artifact will actually load and behave. If you are creating it at runtime, `create_artifact` does the following checks for you — do not skip them by hand-writing files instead; if you are shipping it in the repo, run them yourself:
 
 - **Location & parse**: the file is at `skills/<name>/SKILL.md`, starts with `---`, and has both frontmatter fields on single lines. If unsure, check it parses the way `load_skills()` in `main.py` expects (name + description extracted).
 - **Trigger test**: read the description cold and ask — would an agent with only this description know to fire this skill for each example phrasing from Step 1? If not, sharpen the description; the description is a router.
@@ -57,7 +64,8 @@ Before you hand it over, verify the artifact will actually load and behave:
 
 ### Step 4 — Promote
 
-- New skills are loaded at **startup** by `load_skills()` in `main.py`, so a new skill takes effect on the next run. Tell the user to restart (`python main.py`) and say which skill will appear.
+- Runtime artifacts: promote (or retire) them with `artifact_admin`. Promotion is the trust/durability step — a promoted skill is copied into `skills/`, so it needs a restart; a promoted SOP is listed in the index as a read-only playbook.
+- New repo skills are loaded at **startup** by `load_skills()` in `main.py`, so a new skill takes effect on the next run. Tell the user to restart (`python main.py`) and say which skill will appear.
 - Report what you created, the exact path, and a one-line summary of the trigger. Show the frontmatter description so the user can sanity-check the trigger wording.
 - If the user maintains the vault note `pleiades-vault/skills.md` as a registry, offer to update it — don't edit it unprompted.
 

@@ -34,17 +34,25 @@ The harness records a `conversation` node at startup, a `task` + user/assistant 
 
 Query it via the `graph_query` tool (`summary`, `tools`, `skills`, `sessions`, `tasks`, `lineage`, `cooccurrence`, `search`) or the `/graph` command in both the REPL and the TUI.
 
-8. Creation pipeline v1: tools
+8. Creation pipeline v1: tools √
 
 Self-creation as its own pipeline (trigger → draft → sandbox-validate → provisional register → promote/prune), applied first to tools since they're the smallest blast radius. Establishes the draft/validate/provisional/promote pattern that skills and SOPs will reuse. Needs the sandbox/execution boundary built here too, since self-created tools shouldn't run with the same trust as hand-written ones.
 
-9. Creation pipeline v2: skills
+Implemented in `creation.py`: a `CreationStore` (table `created_artifacts` in `agent_state.db`) plus a `CreationPipeline` that the harness exposes as two tools — `create_artifact` (draft → validate → provisional register) and `artifact_admin` (`list` / `show` / `promote` / `prune`). Validation is behavioural: the draft's own `tests` run before it is registered, and every later call re-execs the tool's source in a **fresh subprocess** (separate interpreter, cwd confined to the repo root, wall-clock timeout, capped output) instead of importing it — so a created tool cannot reach harness internals or patch the loop. That is a boundary, not an OS sandbox: the subprocess still has the user's privileges, so promotion is a trust decision. Provisional artifacts live under `created/`, outside every directory the harness loads at startup, so drafting one cannot change the running agent.
+
+9. Creation pipeline v2: skills √
 
 Same pipeline applied to skills — validation here is behavioral (does invoking it produce expected tool calls on a held-out example) rather than just schema-checking. Self-created skills can reference self-created tools, so tool-tier needs to be stable first. Skill lineage (which conversation birthed it) logged to the graph store.
 
-10. Creation pipeline v3: SOPs
+`kind='skill'` reuses the same lifecycle, but validation is behavioural at a different level: **one bounded model call** runs the draft body against the held-out `example_task` and checks that `expected_tools` actually fire; the draft is rejected otherwise. A provisional skill lives at `created/skills/<name>/SKILL.md` and is listed in the trigger index (projected as `provisional`); promotion copies the file to `skills/<name>/SKILL.md` and needs the documented restart to load from disk, and pruning removes that copy — but only when its content is byte-identical to ours, so a hand-written skill can never be deleted. The artifact node records `created_in` (lineage: which conversation birthed it) and `references` edges to the tools its body names.
+
+10. Creation pipeline v3: SOPs √
 
 Fixed, ordered playbooks for recurring task classes, composed of skills (and sometimes raw tool calls) rather than adapted per-context like skills are. Built last among the creation tiers because an SOP is only trustworthy if the skills it chains are already validated — gate SOP drafting to only use promoted, not provisional, skills, since a rigid workflow built on shaky components is worse than a skill failing on its own.
+
+`kind='sop'` stores an ordered `steps` list. Both drafting *and* promotion are gated on every chained skill being **promoted**, re-checked at promotion because a skill may have been pruned in the meantime. The SOP node carries `composed_of` edges to its skills, and once promoted it is listed in the index as a read-only playbook — deciding *when* to apply one is the router's job (step 11), so an SOP deliberately has no automatic trigger yet.
+
+Review what the agent has built with `artifact_admin` (`list` shows tier and use/failure counts), `/artifacts` in either frontend, or `graph_query(kind="artifacts")`.
 
 11. Router / "brain"
 

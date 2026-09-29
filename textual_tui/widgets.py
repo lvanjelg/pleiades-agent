@@ -43,12 +43,13 @@ class CommandSuggester(Suggester):
         super().__init__(use_cache=False, case_sensitive=False)
         self._app = app
 
-    COMMANDS = ("/provider", "/model", "/thinking", "/graph", "/usage",
-                "/clear", "/help", "/stop", "/quit")
+    COMMANDS = ("/provider", "/model", "/thinking", "/graph", "/artifacts",
+                "/usage", "/clear", "/help", "/stop", "/quit")
     COMMAND_ARGS = {
         "/provider": ("local", "deepseek"),
         "/model": None,               # fetched from the harness, may block
         "/thinking": ("off", "low", "medium", "high", "on"),
+        "/artifacts": ("list", "show", "promote", "prune"),
     }
 
     def _levels(self) -> tuple[str, ...]:
