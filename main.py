@@ -25,6 +25,17 @@ WORKING_ROOT = Path(__file__).resolve().parent
 MAX_TOOL_OUTPUT = 8000
 MAX_SEARCH_MATCHES = 100
 CONTEXT_COMPRESS_THRESHOLD = 0.85
+#: Sent once when a turn comes back with neither text nor a tool call. Reasoning
+#: models can spend a long thinking phase and then return nothing (which shows up
+#: as finish_reason="length"); without this the loop returned "" and the user saw
+#: the agent stop having done nothing.
+EMPTY_TURN_NUDGE = ("Your previous response was empty — no text and no tool call, so nothing "
+                    "was completed. Call the tool you intended to call, or reply to the user. "
+                    "Do not send another empty message.")
+TRUNCATED_TURN_NUDGE = ("Your previous response was cut off by the output limit while you were "
+                        "still thinking, so the user received nothing. Answer now: make a single "
+                        "tool call, or give a short direct reply. Keep it brief.")
+MAX_EMPTY_RETRIES = 1
 ALLOWED_SHELL_COMMANDS = {"git", "pytest", "pip", "python", "python3",
                           "ls", "cat", "echo", "pwd", "wc", "grep", "find"}
 SKILLS_DIR = "skills/"
@@ -55,6 +66,7 @@ class LLMResponse:
     tool_calls: list
     message: dict
     stats: dict
+    finish_reason: str = ""
 
 @dataclass
 class Tool:
@@ -647,7 +659,6 @@ class AgentHarness:
         self.input = 0
         self.output = 0
         self.budgeter = BudgetEnforcer(self.context)
-        self.messages: list[dict] = []
         self.keep_msg_count = 8
         self._cancel = threading.Event()
         """Set by cancel(); the run loop checks it between iterations and tool
@@ -939,22 +950,33 @@ class AgentHarness:
             for t in self.tools.values()
         ]
 
-    def add(self, role: str, content: str, **kwargs):
-        self.messages.append({"role": role, "content": content, **kwargs})
+    def _history(self) -> list[dict]:
+        """Session history for the next request, compacted as it nears the window.
 
-    def get_messages(self) -> list[dict]:
-        # budgeter.tokens_used = the last context size the API reported (usage.prompt_tokens)
+        The DB is the source of truth (it survives restarts), so history is read
+        from it. Compaction used to read ``self.messages`` instead -- an in-memory
+        list nothing ever filled -- which left it unreachable and let the prompt
+        grow without bound until the model stopped answering.
+        """
+        history = self.state.get_messages(self.session_id)
+        # budgeter.tokens_used = the last context size the API reported (prompt_tokens)
         if self.budgeter.tokens_used >= int(self.context * CONTEXT_COMPRESS_THRESHOLD):
-            return self._compress()
-        return list(self.messages)
+            history = self._compress(history)
+        return history
 
-    def _compress(self) -> list[dict]:
+    def _compress(self, messages: list[dict]) -> list[dict]:
+        """Summarise everything but the last ``keep_msg_count`` messages."""
         keep = self.keep_msg_count
-        sys_msgs = [m for m in self.messages if m.get("role") == "system"]
+        sys_msgs = [m for m in messages if m.get("role") == "system"]
         system_msg = sys_msgs[0] if sys_msgs else None
-        others = [m for m in self.messages if m.get("role") != "system"]
+        others = [m for m in messages if m.get("role") != "system"]
         recent = others[-keep:]
-        old = others[:-keep]
+        # Never let the kept window start on an orphan tool result: its assistant
+        # tool_call has just been summarised away, and a tool message with no
+        # matching call is rejected by providers.
+        while recent and recent[0].get("role") == "tool":
+            recent.pop(0)
+        old = others[:len(others) - len(recent)]
         if not old:
             return [system_msg] + recent if system_msg else list(recent)
         lines = []
@@ -983,7 +1005,7 @@ class AgentHarness:
         if getattr(self, "memory_digest", ""):
             messages.append({"role": "system",
                              "content": "CROSS-SESSION MEMORY (graph store)\n" + self.memory_digest})
-        history = self.state.get_messages(self.session_id)
+        history = self._history()
         if not self.provider.reasoning_replay:
             # mlx-serve doesn't want prior chain-of-thought echoed back into the
             # prompt (it would only burn context); DeepSeek requires it.
@@ -995,6 +1017,7 @@ class AgentHarness:
         ]
         self.state.record_message(self.session_id, self.turn, "user", user_input)
         task_node = self._record_turn_graph(user_input)
+        empty_retries = 0
         for i in range(self.max_iterations):
             # Cooperative stop points: before each LLM call, and after each
             # tool call below. Budget (time/tool calls) was previously dead
@@ -1028,16 +1051,21 @@ class AgentHarness:
                 )
             logger.info(response)
             reasoning = response.message.get("reasoning_content", "") if isinstance(response.message, dict) else ""
+            logger.info("[finish_reason]" + str(response.finish_reason))
             logger.info("[reasoning]" + reasoning)
             logger.info("[response]" + response.content)
             if self.bus is not None and reasoning and streamed_reasoning["tokens"] == 0:
                 # Non-stream fallback: surface reasoning that never streamed.
                 self._emit("reasoning", text=reasoning)
-            self.state.record_message(
-                self.session_id, self.turn, "assistant", response.content or "",
-                tool_calls=response.message.get("tool_calls") if isinstance(response.message, dict) else None,
-                reasoning=reasoning,
-            )
+            text = (response.content or "").strip()
+            if text or response.tool_calls:
+                # An empty, action-less turn is not persisted: it would sit in
+                # history and feed the very context growth that produced it.
+                self.state.record_message(
+                    self.session_id, self.turn, "assistant", response.content or "",
+                    tool_calls=response.message.get("tool_calls") if isinstance(response.message, dict) else None,
+                    reasoning=reasoning,
+                )
             if response.content:
                 self._record_message_graph("assistant", response.content, i)
             self.input += response.stats.get("prompt_tokens", 0)
@@ -1047,8 +1075,26 @@ class AgentHarness:
             if self.bus is not None and response.content and streamed["tokens"] == 0:
                 self._emit("message", content=response.content)
             if not response.tool_calls:
-                self._emit("done", content=response.content or "")
-                return response.content
+                if text:
+                    self._emit("done", content=response.content)
+                    return response.content
+                # Nothing usable came back. Ask once more, pointedly, instead of
+                # reporting an empty string as a finished turn.
+                if empty_retries < MAX_EMPTY_RETRIES:
+                    empty_retries += 1
+                    logger.warning("empty assistant turn (finish_reason=%r) — retrying",
+                                   response.finish_reason)
+                    nudge = (TRUNCATED_TURN_NUDGE if response.finish_reason == "length"
+                             else EMPTY_TURN_NUDGE)
+                    messages.append({"role": "user", "content": nudge})
+                    continue
+                note = (f"Incomplete turn: the model returned no answer and no tool call "
+                        f"(finish_reason={response.finish_reason or 'unknown'}, "
+                        f"prompt {response.stats.get('prompt_tokens', 0):,} of "
+                        f"{self.context:,} tokens). Nothing was completed.")
+                logger.warning(note)
+                self._emit("done", content=note)
+                return note
             if self._cancel.is_set():
                 # The model may have streamed tool calls before the flag was
                 # set; don't execute them on a cancelled turn.
@@ -1343,6 +1389,7 @@ class Wrapper:
             ]
         return LLMResponse(
             content=content, tool_calls=calls, message=message, stats=stats,
+            finish_reason=acc.get("finish") or "",
         )
 
     def _error_response(self, message: str) -> LLMResponse:
@@ -1379,6 +1426,7 @@ class Wrapper:
             tool_calls=tools,
             message=message,
             stats=data.get("usage", {}),
+            finish_reason=choice.get("finish_reason") or "",
         )
 
 

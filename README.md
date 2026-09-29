@@ -10,6 +10,8 @@ Name → JSON schema → callable, with register/list/invoke. Hand-written tools
 
 Tokenizer-accurate running count per conversation, plus an eviction policy (drop oldest, summarize-and-evict, or retrieve-relevant-only) for when approaching the context limit. Built early because every subsystem after this consumes budget, and it later doubles as the burn-rate signal for spiral detection.
 
+Implemented in `AgentHarness._history()` + `_compress()`. The running count is the provider-reported `prompt_tokens` from the last call; once it crosses `CONTEXT_COMPRESS_THRESHOLD` (0.85) of the context window, the older messages are folded into one `EARLIER CONTEXT:` system summary and the last `keep_msg_count` (8) messages are kept verbatim. The kept window never *begins* on a tool result, whose matching assistant `tool_call` has just been summarised away. History is read from the DB (it survives restarts), which is where the gate had to live: it previously read an in-memory list that nothing filled, so compaction was unreachable and a single session's prompt grew 5.7k → 48k tokens until the model stopped answering.
+
 4. Global traits √
 
 The small, always-on rule set that isn't task-specific — Socratic style, no-unsolicited-code, verbosity defaults. Implemented as a static system-prompt fragment, sitting beneath everything else. Built now, before skills/personas exist, so it's a stable baseline you can check later additions against ("did this skill/persona override a global trait").

@@ -47,6 +47,21 @@ def test_model_user_and_tokens() -> None:
     assert t.current.finished and not t.busy
 
 
+def test_model_done_note_renders_when_nothing_else_did() -> None:
+    """A terminal note must be visible, or the agent looks like it just stopped."""
+    t = Transcript()
+    t.apply("user", {"content": "q"})
+    t.apply("done", {"content": "Stopped: Token budget exceeded"})
+    assert t.current.reply == "Stopped: Token budget exceeded", t.current.reply
+
+    streamed = Transcript()
+    streamed.apply("user", {"content": "q"})
+    streamed.apply("token", {"text": "the real answer"})
+    streamed.apply("done", {"content": "the real answer"})
+    assert streamed.current.reply == "the real answer", \
+        "a streamed reply must not be duplicated by the done note"
+
+
 def test_model_space_repair_after_tool() -> None:
     """Text resuming after a tool result gets the space the provider omits."""
     t = Transcript()

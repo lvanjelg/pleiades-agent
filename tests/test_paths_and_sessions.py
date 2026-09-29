@@ -246,6 +246,113 @@ class _cwd:
         return False
 
 
+class ScriptedSequence:
+    """Returns scripted responses in order and records the messages each call saw."""
+
+    def __init__(self, responses) -> None:
+        self.responses = list(responses)
+        self.seen: list[list[dict]] = []
+
+    def chat(self, messages, tools=None) -> pleiades.LLMResponse:
+        self.seen.append(list(messages))
+        if self.responses:
+            return self.responses.pop(0)
+        return pleiades.LLMResponse(content="(unscripted)", tool_calls=[],
+                                    message={"role": "assistant", "content": ""}, stats={})
+
+
+def _empty(finish: str = "stop") -> pleiades.LLMResponse:
+    """A thinking-only turn: reasoning but no text and no tool call."""
+    return pleiades.LLMResponse(
+        content="", tool_calls=[],
+        message={"role": "assistant", "content": "", "reasoning_content": "thinking..."},
+        stats={"prompt_tokens": 100, "completion_tokens": 3}, finish_reason=finish)
+
+
+def _answer(text: str) -> pleiades.LLMResponse:
+    return pleiades.LLMResponse(
+        content=text, tool_calls=[], message={"role": "assistant", "content": text},
+        stats={"prompt_tokens": 120, "completion_tokens": 10}, finish_reason="stop")
+
+
+def _empty_assistant_rows(harness) -> int:
+    return harness.state.db.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id=? AND role='assistant' AND content=''",
+        (harness.session_id,)).fetchone()[0]
+
+
+def test_empty_response_is_retried_then_answers() -> None:
+    """A reasoning-only turn (no text, no tool call) must not end the turn blank."""
+    with tempfile.TemporaryDirectory() as tmp, _cwd(tmp):
+        harness = _build()
+        wrapper = ScriptedSequence([_empty(), _answer("here is the answer")])
+        harness.wrapper = wrapper
+        out = harness.run("do the thing")
+        assert out == "here is the answer", out
+        assert len(wrapper.seen) == 2, "the empty turn should be retried exactly once"
+        assert "previous response was empty" in wrapper.seen[1][-1]["content"], \
+            wrapper.seen[1][-1]
+        assert _empty_assistant_rows(harness) == 0, \
+            "an empty assistant turn must not be persisted into history"
+
+
+def test_persistent_empty_response_is_reported_not_silent() -> None:
+    with tempfile.TemporaryDirectory() as tmp, _cwd(tmp):
+        harness = _build()
+        harness.wrapper = ScriptedSequence([_empty("length"), _empty("length")])
+        out = harness.run("do the thing")
+        assert out.strip(), "an empty turn must never be reported as a blank answer"
+        assert "Incomplete turn" in out and "length" in out, out
+        assert _empty_assistant_rows(harness) == 0
+
+
+def test_truncated_turn_gets_the_length_nudge() -> None:
+    """finish_reason='length' means the output cap was hit mid-thinking."""
+    with tempfile.TemporaryDirectory() as tmp, _cwd(tmp):
+        harness = _build()
+        wrapper = ScriptedSequence([_empty("length"), _answer("brief")])
+        harness.wrapper = wrapper
+        harness.run("do the thing")
+        assert "cut off by the output limit" in wrapper.seen[1][-1]["content"], \
+            wrapper.seen[1][-1]
+
+
+# ------------------------------------------------------- history compaction
+def test_history_is_compacted_near_the_window() -> None:
+    """Compaction was unreachable, so the prompt grew without bound."""
+    with tempfile.TemporaryDirectory() as tmp, _cwd(tmp):
+        harness = _build()
+        for turn in range(1, 31):
+            harness.state.record_message(harness.session_id, turn, "user", f"ask {turn}")
+            harness.state.record_message(harness.session_id, turn, "assistant", f"reply {turn}")
+            harness.state.record_message(harness.session_id, turn, "tool", f"out {turn}",
+                                         tool_name="bash", tool_call_id="x")
+        assert len(harness._history()) == 90, "history should be untouched below the threshold"
+
+        harness.budgeter.tokens_used = int(harness.context * 0.95)
+        squeezed = harness._history()
+        assert len(squeezed) < 90, (len(squeezed), 90)
+        assert squeezed[0]["role"] == "system" and "EARLIER CONTEXT" in squeezed[0]["content"]
+        assert squeezed[-1]["content"] == "out 30", "the newest messages must survive intact"
+
+
+def test_compaction_never_orphans_a_tool_result() -> None:
+    """A kept window that begins with a tool message has no matching tool_call."""
+    with tempfile.TemporaryDirectory() as tmp, _cwd(tmp):
+        harness = _build()
+        msgs: list[dict] = []
+        for i in range(6):
+            msgs.append({"role": "assistant", "content": f"call {i}"})
+            msgs.append({"role": "tool", "content": f"out {i}", "tool_call_id": "x"})
+        msgs.append({"role": "user", "content": "final question"})
+
+        out = harness._compress(msgs)
+        assert out[0]["role"] == "system" and "EARLIER CONTEXT" in out[0]["content"]
+        body = [m for m in out if m.get("role") != "system"]
+        assert body and body[0]["role"] != "tool", body
+        assert out[-1]["content"] == "final question"
+
+
 def main() -> None:
     tests = [(name, obj) for name, obj in sorted(globals().items())
              if name.startswith("test_") and callable(obj)]

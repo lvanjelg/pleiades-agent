@@ -338,6 +338,12 @@ class Tui:
             self.usage_in = int(data.get("input_tokens", self.usage_in) or 0)
             self.usage_out = int(data.get("output_tokens", self.usage_out) or 0)
         elif kind is EventKind.DONE:
+            # Carry a terminal note (`Stopped: …`, `Max iterations reached.`,
+            # an incomplete turn) into the reply when nothing else was rendered,
+            # so the agent never appears to just stop with a blank transcript.
+            note = str(data.get("content") or "").strip()
+            if note and not (self._reply or "").strip():
+                self._reply = note
             self.busy = False
             self.status = "ready"
             self.usage_in = int(getattr(self.harness, "input", self.usage_in) or 0)

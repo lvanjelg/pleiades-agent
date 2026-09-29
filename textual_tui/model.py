@@ -200,6 +200,15 @@ class Transcript:
 
         if kind is EventKind.DONE:
             turn = self._turn()
+            # The harness carries a terminal note on `done` whenever a turn ends
+            # without a normal answer: `Stopped: …` (cancel / budget), `Max
+            # iterations reached.`, or an empty model reply. Discarding it left
+            # the transcript blank and the agent looked like it had simply
+            # stopped. Only adopt it when nothing else was rendered, so a
+            # streamed reply is not duplicated.
+            note = str(data.get("content") or "").strip()
+            if note and not turn.reply.strip():
+                turn.reply = note
             turn.finished = True
             self.busy = False
             self.status = "ready"
